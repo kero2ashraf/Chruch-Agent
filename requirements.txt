@@ -1,0 +1,9 @@
+streamlit
+requests
+pydantic>=2
+beautifulsoup4
+pypdf
+python-docx
+reportlab
+arabic-reshaper
+python-bidi
