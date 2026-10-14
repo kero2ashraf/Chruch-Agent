@@ -1166,6 +1166,16 @@ div[data-testid="stAlert"]{border-radius:14px}
 .sec:after{content:"";flex:1;height:2px;background:linear-gradient(90deg,var(--gold),transparent);opacity:.55}
 .badge{display:inline-block;padding:6px 16px;border-radius:999px;font-weight:800;font-size:.95rem}
 .badge.ok{background:#e4f4ec;color:var(--ok)} .badge.rev{background:#fff1d6;color:#9a6a12} .badge.blk{background:#f8e0de;color:var(--bad)}
+/* Arabic (RTL) text: right-aligned paragraphs, bullets on the right next to the text */
+[data-testid="stMarkdownContainer"],[data-testid="stMarkdownContainer"] p,[data-testid="stMarkdownContainer"] h1,
+[data-testid="stMarkdownContainer"] h2,[data-testid="stMarkdownContainer"] h3,[data-testid="stMarkdownContainer"] h4{
+  direction:rtl;text-align:right}
+[data-testid="stMarkdownContainer"] ul,[data-testid="stMarkdownContainer"] ol{direction:rtl;text-align:right;
+  padding-right:1.5rem;padding-left:0;margin-right:0;list-style-position:outside}
+[data-testid="stMarkdownContainer"] li{direction:rtl;text-align:right;margin-bottom:.35rem}
+[data-testid="stMarkdownContainer"] li::marker{color:var(--gold)}
+div[data-testid="stExpander"] details,div[data-testid="stExpander"] summary{direction:rtl;text-align:right}
+div[data-testid="stAlert"]{direction:rtl;text-align:right}
 .foot{text-align:center;color:#7a829c;font-size:.8rem;margin:30px 0 6px}
 </style>"""
 
