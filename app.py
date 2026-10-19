@@ -1153,12 +1153,15 @@ h1,h2,h3,h4{color:var(--navy);font-weight:800}
 div[data-testid="stExpander"]{background:var(--card);border:1.5px solid var(--line) !important;border-radius:18px !important;
   box-shadow:0 4px 14px rgba(20,33,61,.05);margin-bottom:10px;overflow:hidden}
 div[data-testid="stExpander"] summary{font-weight:800;color:var(--navy)}
-[data-testid="stSidebar"]{background:linear-gradient(180deg,#fffaf0,#f3e9d4);border-left:1px solid var(--line);overflow:hidden}
+/* sidebar: native Streamlit collapse behaviour is kept; no border / shadow / resize handle is ever drawn,
+   so no stray vertical line is left on screen when the sidebar is collapsed */
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#fffaf0,#f3e9d4);border:none !important;box-shadow:none !important}
+[data-testid="stSidebar"][aria-expanded="false"]{border:none !important;box-shadow:none !important}
 [data-testid="stSidebarContent"]{direction:rtl;text-align:right}
-[data-testid="stSidebar"][aria-expanded="true"]{min-width:300px}
-/* collapsed sidebar: hide its content so it can't squeeze into a narrow vertical strip */
-[data-testid="stSidebar"][aria-expanded="false"]{min-width:0 !important;width:0 !important;border:none}
-[data-testid="stSidebar"][aria-expanded="false"] *{visibility:hidden !important;width:0 !important;overflow:hidden !important}
+[data-testid="stSidebar"] [data-testid*="esize"],
+[data-testid="stSidebar"] [class*="esize"]{display:none !important}
+[data-testid="stSidebar"]::before,[data-testid="stSidebar"]::after,
+.stApp::before,.stApp::after{display:none !important}
 [data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:var(--navy)}
 .stProgress>div>div>div>div{background:linear-gradient(90deg,var(--gold),var(--gold2))}
 div[data-testid="stAlert"]{border-radius:14px}
@@ -1177,12 +1180,48 @@ div[data-testid="stAlert"]{border-radius:14px}
 div[data-testid="stExpander"] details,div[data-testid="stExpander"] summary{direction:rtl;text-align:right}
 div[data-testid="stAlert"]{direction:rtl;text-align:right}
 .foot{text-align:center;color:#7a829c;font-size:.8rem;margin:30px 0 6px}
+
+/* ---- no sideways overflow / cut-off content ---- */
+html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"]{max-width:100vw;overflow-x:hidden}
+.block-container{width:100%;max-width:1180px;padding:1.4rem clamp(.8rem,3vw,2rem) 3rem}
+[data-testid="stHorizontalBlock"]{flex-wrap:wrap;gap:.75rem}
+[data-testid="stHorizontalBlock"]>[data-testid="stColumn"]{min-width:min(100%,220px)}
+img,svg,canvas,table{max-width:100%}
+[data-testid="stRadio"] div[role="radiogroup"]{flex-wrap:wrap;gap:.4rem}
+
+/* ---- fluid sizing ---- */
+.hero{padding:clamp(18px,4vw,30px) clamp(16px,4vw,34px)}
+.hero h1{font-size:clamp(1.35rem,4.5vw,2rem);line-height:1.35}
+.hero p{font-size:clamp(.9rem,2.4vw,1.02rem)}
+.hero:before{font-size:clamp(120px,30vw,230px)}
+.sec{font-size:clamp(1.05rem,3vw,1.25rem)}
+.ecard{min-height:0}
+.ecard .t{font-size:clamp(.95rem,2.6vw,1.08rem)}
+
+/* ---- tablet / phone ---- */
+@media (max-width:768px){
+  .hero .chips{gap:6px}
+  .chip{font-size:.75rem;padding:3px 9px}
+  .stButton>button,.stDownloadButton>button{width:100%}
+  .stButton>button[kind="primary"]{font-size:.95rem;padding:.6rem .8rem}
+  [data-testid="stHorizontalBlock"]>[data-testid="stColumn"]{flex:1 1 100% !important;width:100% !important}
+}
+@media (max-width:480px){
+  .block-container{padding-top:.8rem}
+  .hero{border-radius:18px}
+}
+
+/* ---- gentle motion ---- */
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.hero,.ecard,div[data-testid="stExpander"]{animation:rise .35s ease both}
+@media (prefers-reduced-motion:reduce){*{animation:none !important;transition:none !important}}
 </style>"""
 
 
 def main_app():
     import streamlit as st
-    st.set_page_config(page_title=APP_TITLE_AR, page_icon="✝️", layout="wide")
+    st.set_page_config(page_title=APP_TITLE_AR, page_icon="✝️", layout="wide",
+                       initial_sidebar_state="auto")
     st.markdown(CSS, unsafe_allow_html=True)
 
     ss = st.session_state
