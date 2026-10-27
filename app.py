@@ -21,6 +21,7 @@ Keys (env var, .env, or .streamlit/secrets.toml):
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import io
 import json
 import logging
@@ -28,6 +29,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, asdict
@@ -42,7 +44,7 @@ from pydantic import BaseModel, ValidationError, field_validator
 # 0. CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 APP_TITLE_AR = "مساعد مدارس الأحد الذكي"
-BUILD = "final-v5"
+BUILD = "final-v6"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 ROUTER_FREE = "openrouter/free"
@@ -60,6 +62,12 @@ ENGINE_ICON = {"gemma": "💎", "gemini": "✨", "auto": "🧭"}
 
 log = logging.getLogger("church_agent")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# Shared across every LLMProvider instance (a new one is created per task), so pacing really holds.
+_PACE_LOCK = threading.Lock()
+_LAST_CALL = {"t": 0.0}
+# Guards writes to the shared lesson state when tasks run in parallel threads.
+_STATE_LOCK = threading.Lock()
 
 
 def get_secret(name: str, default: str = "") -> str:
@@ -128,7 +136,7 @@ class LLMProvider:
         self.timeout, self.max_retries = timeout, max_retries
         self.http, self.sleep = http, sleep
         self.on_model, self.last_model = on_model, ""
-        self.min_interval, self._last_call = min_interval, 0.0
+        self.min_interval = min_interval
         self._no_json_mode: set = set()
 
     @classmethod
@@ -160,11 +168,13 @@ class LLMProvider:
         return h
 
     def _pace(self, ep: Endpoint):
+        """Global (process-wide) spacing between free-route requests, thread-safe."""
         if self.min_interval > 0 and ep.free_route:
-            wait = self.min_interval - (time.monotonic() - self._last_call)
-            if wait > 0:
-                self.sleep(wait)
-        self._last_call = time.monotonic()
+            with _PACE_LOCK:
+                wait = self.min_interval - (time.monotonic() - _LAST_CALL["t"])
+                if wait > 0:
+                    self.sleep(wait)
+                _LAST_CALL["t"] = time.monotonic()
 
     # -- core call --------------------------------------------------------
     def chat(self, messages: List[Dict[str, str]], **kw) -> str:
@@ -746,10 +756,15 @@ def invalid_citations(obj: Any, n_refs: int) -> List[int]:
     return sorted(n for n in nums if n < 1 or n > n_refs)
 
 
+# Each quote style is matched with its own opener/closer, so a quote can no longer span unrelated text.
+QUOTE_RE = re.compile(r"«([^»]{10,300})»|“([^”]{10,300})”|\"([^\"]{10,300})\"")
+
+
 def unverified_quotes(text: str, chunks: List[Chunk], min_words: int = 5) -> List[str]:
     corpus = ar_norm(" ".join(c.text for c in chunks))
     bad = []
-    for q in re.findall(r"[«\"“]([^»\"”]{10,300})[»\"”]", text):
+    for m in QUOTE_RE.finditer(text):
+        q = next(g for g in m.groups() if g)
         if len(q.split()) >= min_words and ar_norm(q).strip() not in corpus:
             bad.append(q.strip())
     return bad
@@ -917,7 +932,6 @@ def run_task(name: str, state: dict, kb: KnowledgeBase, provider: LLMProvider, e
     """Regenerates ONLY the requested component; everything else in `state` is untouched."""
     schema, _, instr = TASKS[name]
     chunks, occ = retrieve_for(state, kb, extra)
-    state["occasion"] = occ or state.get("occasion")
     existing = {k: state[k] for k in STATE_KEYS_FOR_CONTEXT if state.get(k) and k != name}
     user = (f"طلب الخادم/الدرس:\n{state['input']}\n\n"
             f"المراجع المسترجعة:\n{build_context(chunks, occ)}\n\n"
@@ -929,9 +943,12 @@ def run_task(name: str, state: dict, kb: KnowledgeBase, provider: LLMProvider, e
     bad = invalid_citations(data, len(chunks))
     if bad:
         data.setdefault("review_flags", []).append(f"إشارات مراجع غير موجودة {bad} — تم تجاهلها وتحتاج مراجعة.")
-    state[name] = data
-    state["refs"][name] = [asdict(c) for c in chunks]
-    state["validation"], state["gate"] = None, None
+    # All shared-state writes happen under one lock (tasks may run in parallel threads).
+    with _STATE_LOCK:
+        state["occasion"] = occ or state.get("occasion")
+        state[name] = data
+        state["refs"][name] = [asdict(c) for c in chunks]
+        state["validation"], state["gate"] = None, None
     return data
 
 
@@ -1109,109 +1126,158 @@ def blocks_to_pdf(blocks: List[Tuple[str, str]]) -> bytes:
     return bio.getvalue()
 
 
+# Cached exports: rebuilt only when the content changes, not on every Streamlit rerun.
+@functools.lru_cache(maxsize=32)
+def _docx_cached(blocks_json: str) -> bytes:
+    return blocks_to_docx([tuple(b) for b in json.loads(blocks_json)])
+
+
+@functools.lru_cache(maxsize=32)
+def _pdf_cached(blocks_json: str) -> bytes:
+    return blocks_to_pdf([tuple(b) for b in json.loads(blocks_json)])
+
+
 # ════════════════════════════════════════════════════════════════════════════
-# 7. STREAMLIT UI  (RTL, parchment + navy + gold theme)
+# 7. STREAMLIT UI  (RTL content, adaptive light/dark theme, fluid sizing)
 # ════════════════════════════════════════════════════════════════════════════
+# Rules that keep the layout working on every screen:
+#  * direction:rtl is applied ONLY to content areas (stMain / stSidebarContent), never to .stApp or the
+#    flex shell -> the sidebar is no longer squeezed to a thin strip on phones.
+#  * no overflow:hidden on html/body/stApp/stAppViewContainer -> Streamlit's mobile sidebar overlay works.
+#  * every colour is a token; dark mode only redefines tokens (prefers-color-scheme).
+#  * sizes use clamp()/min() and columns wrap, so it adapts without per-device hacks.
 CSS = """<style>
 @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap');
-:root{--navy:#14213d;--navy2:#2a3f6f;--gold:#c8963e;--gold2:#e6b95c;--cream:#fbf7ef;--sand:#f1e8d6;
-      --ink:#1f2a44;--ok:#2e7d5b;--bad:#b4443c;--card:#ffffff;--line:#e6dcc6}
+
+/* ========== design tokens (light) ========== */
+:root{
+  --navy:#14213d; --navy2:#2a3f6f; --gold:#c8963e; --gold2:#e6b95c;
+  --bg1:#fbf7ef; --bg2:#f4ecdc; --glow:#fff7e0;
+  --card:#ffffff; --card-sel:#fffdf6; --card-off:#f6f2e8;
+  --ink:#1f2a44; --muted:#5b6684; --heading:#14213d;
+  --line:#e6dcc6; --input:#ffffff;
+  --ok:#2e7d5b; --ok-bg:#e4f4ec; --bad:#b4443c; --bad-bg:#f8e0de; --warn:#9a6a12; --warn-bg:#fff1d6;
+  --side1:#fffaf0; --side2:#f3e9d4;
+  --shadow:rgba(20,33,61,.08);
+  --r:clamp(12px,2vw,18px);
+  --gap:clamp(.5rem,1.6vw,1rem);
+}
+/* ========== design tokens (dark) ========== */
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg1:#0f1626; --bg2:#141d33; --glow:#26304f;
+    --card:#1a2440; --card-sel:#212c4c; --card-off:#161e36;
+    --ink:#e8ecf7; --muted:#a3adc8; --heading:#f0d9a8;
+    --line:#2e3a5c; --input:#16203a;
+    --ok:#6fd0a0; --ok-bg:#16382a; --bad:#ff9a92; --bad-bg:#3d1f1f; --warn:#f2c46b; --warn-bg:#3b2f14;
+    --side1:#121a30; --side2:#0f1626;
+    --shadow:rgba(0,0,0,.4);
+  }
+}
+
 html, body, [class*="css"], .stApp, .stMarkdown, button, input, textarea, label{
   font-family:'Cairo','Segoe UI',Tahoma,sans-serif !important}
-.stApp{direction:rtl;text-align:right;color:var(--ink);
-  background:radial-gradient(1200px 500px at 90% -10%,#fff7e0 0,transparent 60%),
-             linear-gradient(180deg,var(--cream) 0%,#f4ecdc 100%)}
-.block-container{padding-top:1.4rem;max-width:1180px}
-h1,h2,h3,h4{color:var(--navy);font-weight:800}
-.hero{position:relative;overflow:hidden;border-radius:24px;padding:30px 34px;margin-bottom:20px;color:#fff;
-  background:linear-gradient(135deg,var(--navy) 0%,var(--navy2) 62%,#8a6a2c 150%);
-  box-shadow:0 14px 34px rgba(20,33,61,.28)}
-.hero:before{content:"✝";position:absolute;left:-10px;top:-40px;font-size:230px;opacity:.07;color:#fff}
-.hero h1{color:#fff;margin:0 0 6px;font-size:2rem}
-.hero p{margin:0;opacity:.88;font-size:1.02rem}
-.hero .chips{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap}
-.chip{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.28);padding:4px 12px;border-radius:999px;font-size:.85rem}
-.ecard{background:var(--card);border:1.5px solid var(--line);border-radius:18px;padding:14px 16px;min-height:112px;
-  box-shadow:0 4px 14px rgba(20,33,61,.06);transition:.2s}
-.ecard.sel{border-color:var(--gold);box-shadow:0 6px 20px rgba(200,150,62,.28);background:linear-gradient(180deg,#fffdf6,#fff)}
-.ecard.off{opacity:.62;background:#f6f2e8}
-.ecard .t{font-weight:800;color:var(--navy);font-size:1.08rem}
-.ecard .n{font-size:.82rem;color:#5b6684;margin-top:4px}
-.pill{display:inline-block;font-size:.72rem;font-weight:700;padding:2px 9px;border-radius:999px;margin-right:6px}
-.pill.ok{background:#e4f4ec;color:var(--ok)} .pill.off{background:#f3e3e1;color:var(--bad)}
-.stButton>button,.stDownloadButton>button{border-radius:14px;border:1.5px solid var(--navy);background:#fff;color:var(--navy);
-  font-weight:700;padding:.45rem 1rem;transition:.18s}
-.stButton>button:hover,.stDownloadButton>button:hover{background:var(--navy);color:#fff;transform:translateY(-1px);
-  box-shadow:0 6px 16px rgba(20,33,61,.22)}
-.stButton>button[kind="primary"]{background:linear-gradient(135deg,var(--gold),#a97420);border:none;color:#fff;
-  font-size:1.05rem;padding:.7rem 1.2rem;box-shadow:0 8px 20px rgba(200,150,62,.38)}
-.stButton>button[kind="primary"]:hover{filter:brightness(1.07);background:linear-gradient(135deg,var(--gold2),#b4812c)}
-.stTextArea textarea,.stTextInput input{direction:rtl;text-align:right;border-radius:14px !important;
-  border:1.5px solid var(--line) !important;background:#fff !important;color:var(--ink) !important}
-.stTextArea textarea:focus,.stTextInput input:focus{border-color:var(--gold) !important;box-shadow:0 0 0 3px rgba(200,150,62,.2) !important}
-.stChatInput textarea{direction:rtl;text-align:right}
-div[data-testid="stExpander"]{background:var(--card);border:1.5px solid var(--line) !important;border-radius:18px !important;
-  box-shadow:0 4px 14px rgba(20,33,61,.05);margin-bottom:10px;overflow:hidden}
-div[data-testid="stExpander"] summary{font-weight:800;color:var(--navy)}
-/* sidebar: native Streamlit collapse behaviour is kept; no border / shadow / resize handle is ever drawn,
-   so no stray vertical line is left on screen when the sidebar is collapsed */
-[data-testid="stSidebar"]{background:linear-gradient(180deg,#fffaf0,#f3e9d4);border:none !important;box-shadow:none !important}
-[data-testid="stSidebar"][aria-expanded="false"]{border:none !important;box-shadow:none !important}
-[data-testid="stSidebarContent"]{direction:rtl;text-align:right}
+
+/* ========== APP SHELL: never set direction / overflow here ========== */
+.stApp{
+  color:var(--ink);
+  background:radial-gradient(1200px 500px at 90% -10%,var(--glow) 0,transparent 60%),
+             linear-gradient(180deg,var(--bg1) 0%,var(--bg2) 100%)}
+
+/* ========== RTL only on CONTENT ========== */
+[data-testid="stMain"], [data-testid="stSidebarContent"]{direction:rtl;text-align:right}
+[data-testid="stMain"]{overflow-x:clip}
+.block-container{width:100%;max-width:1180px;
+  padding:clamp(.8rem,2vw,1.4rem) clamp(.8rem,3vw,2rem) 3rem}
+
+h1,h2,h3,h4{color:var(--heading);font-weight:800}
+
+/* ========== SIDEBAR: sane width, wrap words not letters ========== */
+[data-testid="stSidebar"]{
+  background:linear-gradient(180deg,var(--side1),var(--side2));
+  border:none !important;box-shadow:none !important}
+[data-testid="stSidebar"][aria-expanded="true"]{min-width:min(86vw,320px)}
+[data-testid="stSidebarContent"]{word-break:normal;overflow-wrap:break-word}
+[data-testid="stSidebarContent"] *{word-break:normal}
 [data-testid="stSidebar"] [data-testid*="esize"],
 [data-testid="stSidebar"] [class*="esize"]{display:none !important}
-[data-testid="stSidebar"]::before,[data-testid="stSidebar"]::after,
-.stApp::before,.stApp::after{display:none !important}
-[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:var(--navy)}
+[data-testid="stSidebar"]::before,[data-testid="stSidebar"]::after{display:none !important}
+[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:var(--heading)}
+
+/* ========== hero ========== */
+.hero{position:relative;overflow:hidden;border-radius:calc(var(--r) + 6px);
+  padding:clamp(18px,4vw,30px) clamp(16px,4vw,34px);margin-bottom:var(--gap);color:#fff;
+  background:linear-gradient(135deg,var(--navy) 0%,var(--navy2) 62%,#8a6a2c 150%);
+  box-shadow:0 14px 34px var(--shadow)}
+.hero:before{content:"✝";position:absolute;left:-10px;top:-40px;font-size:clamp(120px,30vw,230px);opacity:.07;color:#fff}
+.hero h1{color:#fff;margin:0 0 6px;font-size:clamp(1.3rem,4.5vw,2rem);line-height:1.35}
+.hero p{margin:0;opacity:.9;font-size:clamp(.88rem,2.4vw,1.02rem)}
+.hero .chips{margin-top:14px;display:flex;gap:6px;flex-wrap:wrap}
+.chip{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.28);
+  padding:3px clamp(8px,2vw,12px);border-radius:999px;font-size:clamp(.72rem,2vw,.85rem)}
+
+/* ========== engine cards ========== */
+.ecard{background:var(--card);border:1.5px solid var(--line);border-radius:var(--r);padding:14px 16px;
+  box-shadow:0 4px 14px var(--shadow);transition:.2s}
+.ecard.sel{border-color:var(--gold);background:var(--card-sel);box-shadow:0 6px 20px rgba(200,150,62,.28)}
+.ecard.off{opacity:.62;background:var(--card-off)}
+.ecard .t{font-weight:800;color:var(--heading);font-size:clamp(.95rem,2.6vw,1.08rem)}
+.ecard .n{font-size:.82rem;color:var(--muted);margin-top:4px}
+.pill{display:inline-block;font-size:.72rem;font-weight:700;padding:2px 9px;border-radius:999px;margin-right:6px}
+.pill.ok{background:var(--ok-bg);color:var(--ok)} .pill.off{background:var(--bad-bg);color:var(--bad)}
+
+/* ========== buttons / inputs ========== */
+.stButton>button,.stDownloadButton>button{border-radius:14px;border:1.5px solid var(--gold);
+  background:var(--card);color:var(--heading);font-weight:700;padding:.45rem 1rem;transition:.18s}
+.stButton>button:hover,.stDownloadButton>button:hover{background:var(--navy);color:#fff;
+  transform:translateY(-1px);box-shadow:0 6px 16px var(--shadow)}
+.stButton>button[kind="primary"]{background:linear-gradient(135deg,var(--gold),#a97420);border:none;color:#fff;
+  font-size:clamp(.95rem,2.4vw,1.05rem);padding:.7rem 1.2rem;box-shadow:0 8px 20px rgba(200,150,62,.38)}
+.stButton>button[kind="primary"]:hover{filter:brightness(1.07)}
+.stTextArea textarea,.stTextInput input{direction:rtl;text-align:right;border-radius:14px !important;
+  border:1.5px solid var(--line) !important;background:var(--input) !important;color:var(--ink) !important}
+.stTextArea textarea:focus,.stTextInput input:focus{border-color:var(--gold) !important;
+  box-shadow:0 0 0 3px rgba(200,150,62,.2) !important}
+.stChatInput textarea{direction:rtl;text-align:right}
+
+/* ========== expanders / alerts / progress ========== */
+div[data-testid="stExpander"]{background:var(--card);border:1.5px solid var(--line) !important;
+  border-radius:var(--r) !important;box-shadow:0 4px 14px var(--shadow);margin-bottom:10px;overflow:hidden}
+div[data-testid="stExpander"] summary{font-weight:800;color:var(--heading)}
+div[data-testid="stExpander"] details,div[data-testid="stExpander"] summary,
+div[data-testid="stAlert"]{direction:rtl;text-align:right;border-radius:14px}
 .stProgress>div>div>div>div{background:linear-gradient(90deg,var(--gold),var(--gold2))}
-div[data-testid="stAlert"]{border-radius:14px}
-.sec{display:flex;align-items:center;gap:10px;margin:26px 0 10px;font-weight:800;color:var(--navy);font-size:1.25rem}
+
+/* ========== section titles / badges ========== */
+.sec{display:flex;align-items:center;gap:10px;margin:clamp(18px,4vw,26px) 0 10px;font-weight:800;
+  color:var(--heading);font-size:clamp(1.05rem,3vw,1.25rem)}
 .sec:after{content:"";flex:1;height:2px;background:linear-gradient(90deg,var(--gold),transparent);opacity:.55}
 .badge{display:inline-block;padding:6px 16px;border-radius:999px;font-weight:800;font-size:.95rem}
-.badge.ok{background:#e4f4ec;color:var(--ok)} .badge.rev{background:#fff1d6;color:#9a6a12} .badge.blk{background:#f8e0de;color:var(--bad)}
-/* Arabic (RTL) text: right-aligned paragraphs, bullets on the right next to the text */
-[data-testid="stMarkdownContainer"],[data-testid="stMarkdownContainer"] p,[data-testid="stMarkdownContainer"] h1,
-[data-testid="stMarkdownContainer"] h2,[data-testid="stMarkdownContainer"] h3,[data-testid="stMarkdownContainer"] h4{
-  direction:rtl;text-align:right}
+.badge.ok{background:var(--ok-bg);color:var(--ok)} .badge.rev{background:var(--warn-bg);color:var(--warn)}
+.badge.blk{background:var(--bad-bg);color:var(--bad)}
+
+/* ========== Arabic markdown ========== */
+[data-testid="stMarkdownContainer"],[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] h1,[data-testid="stMarkdownContainer"] h2,
+[data-testid="stMarkdownContainer"] h3,[data-testid="stMarkdownContainer"] h4{direction:rtl;text-align:right}
 [data-testid="stMarkdownContainer"] ul,[data-testid="stMarkdownContainer"] ol{direction:rtl;text-align:right;
   padding-right:1.5rem;padding-left:0;margin-right:0;list-style-position:outside}
 [data-testid="stMarkdownContainer"] li{direction:rtl;text-align:right;margin-bottom:.35rem}
 [data-testid="stMarkdownContainer"] li::marker{color:var(--gold)}
-div[data-testid="stExpander"] details,div[data-testid="stExpander"] summary{direction:rtl;text-align:right}
-div[data-testid="stAlert"]{direction:rtl;text-align:right}
-.foot{text-align:center;color:#7a829c;font-size:.8rem;margin:30px 0 6px}
+.foot{text-align:center;color:var(--muted);font-size:.8rem;margin:30px 0 6px}
 
-/* ---- no sideways overflow / cut-off content ---- */
-html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"]{max-width:100vw;overflow-x:hidden}
-.block-container{width:100%;max-width:1180px;padding:1.4rem clamp(.8rem,3vw,2rem) 3rem}
-[data-testid="stHorizontalBlock"]{flex-wrap:wrap;gap:.75rem}
+/* ========== responsive columns: wrap instead of overflowing ========== */
+[data-testid="stHorizontalBlock"]{flex-wrap:wrap;gap:var(--gap)}
 [data-testid="stHorizontalBlock"]>[data-testid="stColumn"]{min-width:min(100%,220px)}
-img,svg,canvas,table{max-width:100%}
 [data-testid="stRadio"] div[role="radiogroup"]{flex-wrap:wrap;gap:.4rem}
+img,svg,canvas,table{max-width:100%}
 
-/* ---- fluid sizing ---- */
-.hero{padding:clamp(18px,4vw,30px) clamp(16px,4vw,34px)}
-.hero h1{font-size:clamp(1.35rem,4.5vw,2rem);line-height:1.35}
-.hero p{font-size:clamp(.9rem,2.4vw,1.02rem)}
-.hero:before{font-size:clamp(120px,30vw,230px)}
-.sec{font-size:clamp(1.05rem,3vw,1.25rem)}
-.ecard{min-height:0}
-.ecard .t{font-size:clamp(.95rem,2.6vw,1.08rem)}
-
-/* ---- tablet / phone ---- */
 @media (max-width:768px){
-  .hero .chips{gap:6px}
-  .chip{font-size:.75rem;padding:3px 9px}
   .stButton>button,.stDownloadButton>button{width:100%}
-  .stButton>button[kind="primary"]{font-size:.95rem;padding:.6rem .8rem}
   [data-testid="stHorizontalBlock"]>[data-testid="stColumn"]{flex:1 1 100% !important;width:100% !important}
 }
-@media (max-width:480px){
-  .block-container{padding-top:.8rem}
-  .hero{border-radius:18px}
-}
 
-/* ---- gentle motion ---- */
+/* ========== motion ========== */
 @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 .hero,.ecard,div[data-testid="stExpander"]{animation:rise .35s ease both}
 @media (prefers-reduced-motion:reduce){*{animation:none !important;transition:none !important}}
@@ -1221,7 +1287,7 @@ img,svg,canvas,table{max-width:100%}
 def main_app():
     import streamlit as st
     st.set_page_config(page_title=APP_TITLE_AR, page_icon="✝️", layout="wide",
-                       initial_sidebar_state="auto")
+                       initial_sidebar_state="collapsed")
     st.markdown(CSS, unsafe_allow_html=True)
 
     ss = st.session_state
@@ -1444,11 +1510,12 @@ def main_app():
     if not sets:
         st.caption("لا يوجد محتوى للتصدير بعد.")
     for title, blocks in sets.items():
+        bj = json.dumps(blocks, ensure_ascii=False)
         c1, c2, c3 = st.columns([2, 1, 1])
         c1.write(f"**{title}**")
-        c2.download_button("DOCX", blocks_to_docx(blocks), f"{title}.docx", key=f"d_{title}")
+        c2.download_button("DOCX", _docx_cached(bj), f"{title}.docx", key=f"d_{title}")
         try:
-            c3.download_button("PDF", blocks_to_pdf(blocks), f"{title}.pdf", key=f"p_{title}")
+            c3.download_button("PDF", _pdf_cached(bj), f"{title}.pdf", key=f"p_{title}")
         except Exception as e:
             c3.caption("PDF: " + str(e)[:120])
 
@@ -1568,6 +1635,9 @@ def run_selftests() -> int:
             "<a href='https://x.org/sec/b.html'>b</a></body></html>")
 
     class T(unittest.TestCase):
+        def setUp(self):
+            _LAST_CALL["t"] = 0.0          # pacing is global now -> isolate every test
+
         def test_missing_key_messages(self):
             with self.assertRaises(LLMError) as c:
                 P("", M).chat(MSG)
@@ -1661,6 +1731,13 @@ def run_selftests() -> int:
             p = P("k", M, http=h, sleep=waits.append, min_interval=5.0)
             p.chat(MSG)
             p.chat(MSG)
+            self.assertTrue(waits and waits[0] > 0)
+
+        def test_pacing_shared_across_providers(self):
+            waits = []
+            h = FakeHTTP([ok_resp("1"), ok_resp("2")])
+            P("k", M, http=h, sleep=waits.append, min_interval=5.0).chat(MSG)
+            P("k", M, http=h, sleep=waits.append, min_interval=5.0).chat(MSG)   # a NEW provider must still wait
             self.assertTrue(waits and waits[0] > 0)
 
         def test_no_pacing_for_gemini(self):
@@ -1791,6 +1868,12 @@ def run_selftests() -> int:
             self.assertEqual(unverified_quotes("«كلام مخترع تماما لا وجود له هنا»", c), ["كلام مخترع تماما لا وجود له هنا"])
             self.assertEqual(unverified_quotes("«اذهبوا إلى العالم كله»", c), [])
 
+        def test_quote_regex_does_not_span_styles(self):
+            c = [Chunk("نص مرجعي", "t", "u", "u", "", "biblical", "s")]
+            txt = "«قصير» ثم كلام طويل بين الاقتباسين لا علاقة له بشيء « وهذا اقتباس آخر مختلف تماما عن الأول هنا »"
+            out = unverified_quotes(txt, c)
+            self.assertEqual(out, ["وهذا اقتباس آخر مختلف تماما عن الأول هنا"])
+
         def test_calendar(self):
             self.assertEqual(orthodox_easter(2026), dt.date(2026, 4, 12))
             self.assertEqual(occasions_for_year(2026)["عيد الرسل"]["date"], dt.date(2026, 7, 12))
@@ -1854,6 +1937,20 @@ def run_selftests() -> int:
             run_task("activities", S, self._kb([]), p)
             self.assertEqual(S["refs"]["activities"], [])
 
+        def test_parallel_run_task_keeps_all_parts(self):
+            from concurrent.futures import ThreadPoolExecutor
+            S = new_state()
+            S["input"] = "درس عن الصدق"
+            kb = self._kb([])
+            quiz = json.dumps({"title": "ق", "questions": []}, ensure_ascii=False)
+
+            def go(n, out):
+                p, _ = self._prov([out])
+                run_task(n, S, kb, p)
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                list(ex.map(lambda a: go(*a), [("activities", self.ACT), ("quiz", quiz)]))
+            self.assertTrue(S["activities"] and S["quiz"])
+
         def test_exports(self):
             S = new_state()
             S["lesson"] = Lesson(title="درس", objectives=["أ"], sections=[LessonSection(heading="ع", body="نص عربي")]).model_dump()
@@ -1863,7 +1960,10 @@ def run_selftests() -> int:
             self.assertFalse(any("الإجابة الصحيحة" in t for _, t in sets["أوراق الأطفال"]))
             try:
                 import docx  # noqa
+                bj = json.dumps(sets["الدرس"], ensure_ascii=False)
                 self.assertTrue(blocks_to_docx(sets["الدرس"]).startswith(b"PK"))
+                self.assertTrue(_docx_cached(bj).startswith(b"PK"))
+                self.assertIs(_docx_cached(bj), _docx_cached(bj))      # served from cache
             except ImportError:
                 self.skipTest("python-docx missing")
             try:
