@@ -44,7 +44,7 @@ from pydantic import BaseModel, ValidationError, field_validator
 # 0. CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 APP_TITLE_AR = "مساعد مدارس الأحد الذكي"
-BUILD = "final-v6"
+BUILD = "final-v7"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 ROUTER_FREE = "openrouter/free"
@@ -770,6 +770,36 @@ def unverified_quotes(text: str, chunks: List[Chunk], min_words: int = 5) -> Lis
     return bad
 
 
+# Free models sometimes write schema field names INSIDE the text, e.g. "(source_tag: منهج)" or
+# "[review_flags: ...]". Those are removed from the visible text; review_flags content is moved to the flags list.
+_FLAG_LEAK = re.compile(r"[\[\(]\s*review_flags\s*[:：]\s*(.*?)[\]\)]", re.S)
+_TAG_LEAK = re.compile(r"[\[\(]\s*source_tag\s*[:：]?\s*[^\]\)]*[\]\)]")
+_BARE_LEAK = re.compile(r"\b(?:source_tag|review_flags|bible_refs)\b\s*[:：]?", re.I)
+
+
+def clean_leaks(text: str, flags: List[str]) -> str:
+    def grab(m):
+        f = m.group(1).strip()
+        if f:
+            flags.append(f)
+        return ""
+    t = _FLAG_LEAK.sub(grab, text)
+    t = _TAG_LEAK.sub("", t)
+    t = _BARE_LEAK.sub("", t)
+    t = re.sub(r"\(\s*\)|\[\s*\]", "", t)
+    return re.sub(r"[ \t]{2,}", " ", t).strip() if t != text else text
+
+
+def scrub_leaks(obj: Any, flags: List[str]) -> Any:
+    if isinstance(obj, str):
+        return clean_leaks(obj, flags)
+    if isinstance(obj, list):
+        return [scrub_leaks(x, flags) for x in obj]
+    if isinstance(obj, dict):
+        return {k: scrub_leaks(v, flags) for k, v in obj.items()}
+    return obj
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 4. SCHEMAS + VALIDATION GATE
 # ════════════════════════════════════════════════════════════════════════════
@@ -900,7 +930,7 @@ SYSTEM_BASE = (
     "اقتبس فقط من المراجع المرفقة، واذكر رقم المرجع بالشكل [م1]. (3) ميّز بين: منهج / مرجع / شرح / إبداع / مراجعة عبر source_tag. "
     "(4) إن لم تتأكد من معلومة عقائدية أو تاريخية ضعها في review_flags. (5) إن اختلفت المراجع لا تدمجها؛ اذكر الاختلاف. "
     "(6) الأنشطة آمنة تمامًا للأطفال: بلا نار أو أدوات حادة أو مواد خطرة. (7) لا تذكر الأعياد إلا إذا كانت ذات صلة بالطلب. "
-    "(8) كن موجزًا ومحدد البنية."
+    "(8) كن موجزًا ومحدد البنية. (9) لا تكتب أسماء الحقول التقنية (source_tag, review_flags, refs) داخل النصوص إطلاقًا؛ ضع قيمها في حقولها المخصصة فقط."
 )
 CHAT_SYSTEM = SYSTEM_BASE + " في المحادثة تكلم مع الخادم بالعامية المصرية الودودة، واقترح أفكارًا عملية وبسيطة الخامات، واسأل سؤالًا واحدًا فقط عند الحاجة."
 
@@ -939,7 +969,10 @@ def run_task(name: str, state: dict, kb: KnowledgeBase, provider: LLMProvider, e
             + (f"ملاحظة إضافية: {extra}\n\n" if extra else "") + f"المهمة: {instr}")
     obj = provider.structured(schema, [{"role": "system", "content": SYSTEM_BASE}, {"role": "user", "content": user}],
                               max_tokens=3500)
-    data = obj.model_dump()
+    leaked: List[str] = []
+    data = scrub_leaks(obj.model_dump(), leaked)
+    if leaked:
+        data.setdefault("review_flags", []).extend(leaked)
     bad = invalid_citations(data, len(chunks))
     if bad:
         data.setdefault("review_flags", []).append(f"إشارات مراجع غير موجودة {bad} — تم تجاهلها وتحتاج مراجعة.")
@@ -971,6 +1004,70 @@ def run_validation(state: dict, provider: LLMProvider) -> dict:
     state["validation"] = {**v.model_dump(), "issues": [i.model_dump() for i in issues], "backend_notes": notes}
     state["gate"] = status
     return state["validation"]
+
+
+class Job:
+    """Background generation job. Plain data + lock: worker threads never touch Streamlit state,
+    so the UI stays fully interactive while a lesson is being generated."""
+
+    def __init__(self, total: int):
+        self.lock = threading.Lock()
+        self.total, self.done = max(total, 1), 0
+        self.text, self.errors = "جاري البدء...", {}
+        self.finished, self.ok, self.last_model = False, False, ""
+
+    def update(self, text: Optional[str] = None, inc: int = 0):
+        with self.lock:
+            if text:
+                self.text = text
+            self.done += inc
+
+    def fraction(self) -> float:
+        return min(self.done / self.total, 1.0)
+
+
+def run_job(job: Job, S: dict, kb: KnowledgeBase, make_provider: Callable[[], LLMProvider],
+            names: List[str], validate: bool = True, skip_done: bool = True, extra: str = "", fast: bool = False):
+    """Runs the requested tasks (+ optional validation). Never raises: results/errors are stored on `job`."""
+    def fail(key: str, e: Exception):
+        job.errors[key] = e.msg_ar if isinstance(e, LLMError) else redact(str(e))[:200]
+    try:
+        todo = [n for n in names if not (S.get(n) and skip_done)]
+        job.update(inc=len(names) - len(todo))
+        if fast and len(todo) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            job.update(f"⚡ توليد {len(todo)} أجزاء معًا ...")
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                futs = {ex.submit(run_task, n, S, kb, make_provider(), extra): n for n in todo}
+                for fut in as_completed(futs):
+                    n = futs[fut]
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        fail(n, e)
+                    job.update(f"اكتمل: {TASKS[n][1]}", inc=1)
+        else:
+            for n in todo:
+                job.update(f"جاري توليد {TASKS[n][1]} ...")
+                try:
+                    run_task(n, S, kb, make_provider(), extra)
+                except Exception as e:
+                    fail(n, e)
+                    break
+                job.update(inc=1)
+        if validate and not job.errors:
+            job.update("جاري المراجعة ...")
+            try:
+                run_validation(S, make_provider())
+            except Exception as e:
+                fail("validation", e)
+            job.update(inc=1)
+    except Exception as e:           # last-resort guard so the UI never waits forever
+        fail("job", e)
+    finally:
+        job.ok = not job.errors
+        job.text = "✅ اكتمل التوليد" if job.ok else "توقف التوليد"
+        job.finished = True
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1327,6 +1424,21 @@ def main_app():
             st.error("حدث خطأ غير متوقع: " + redact(str(e), "".join(keys()))[:250])
         return None
 
+    def start_job(names: List[str], validate: bool, extra: str = ""):
+        """Runs generation in a background thread so every widget keeps working meanwhile."""
+        eps = endpoints(ss["engine"], ss["auto_fb"])
+        site, app = get_secret("OPENROUTER_SITE_URL"), get_secret("OPENROUTER_APP_NAME", "Church Lesson Creative Teaching Agent")
+        job = Job(len(names) + (1 if validate else 0))
+        make = lambda: LLMProvider(eps, site_url=site, min_interval=FREE_MIN_INTERVAL, app_name=app,
+                                   on_model=lambda m: setattr(job, "last_model", m))
+        fast = bool(eps) and eps[0].kind == "gemini"      # Gemini has no 20/min cap -> run parts together
+        ss["job"] = job
+        threading.Thread(target=run_job, args=(job, S, kb, make, names, validate, ss["skip_done"], extra, fast),
+                         daemon=True).start()
+
+    job = ss.get("job")
+    running = bool(job and not job.finished)
+
     ork, gk = keys()
     status = engine_status(ss["free_map"], ork, gk)
     if ss.get("engine") not in ENGINES:
@@ -1358,7 +1470,7 @@ def main_app():
                     st.write(f"❌ {ENGINE_AR[n]} — {e.msg_ar[:160]}")
         st.caption("الحد المجاني على OpenRouter ≈ 20 طلب/دقيقة، لذلك يبطّئ التطبيق طلباته عبره فقط.")
         st.divider()
-        if st.button("🗑️ بدء درس جديد"):
+        if st.button("🗑️ بدء درس جديد", disabled=running):
             ss["S"] = new_state()
             st.rerun()
 
@@ -1380,6 +1492,8 @@ def main_app():
           <div class="n">{note}</div></div>""", unsafe_allow_html=True)
     st.radio("المحرّك", ENGINES, key="engine", horizontal=True, format_func=lambda n: f"{ENGINE_ICON[n]} {ENGINE_AR[n]}",
              label_visibility="collapsed")
+    if job and job.last_model:
+        ss["last_model"] = job.last_model
     if ss.get("last_model"):
         st.caption(f"آخر نموذج استجاب: {ss['last_model']}")
     has_engine = bool(endpoints(ss["engine"], ss["auto_fb"]))
@@ -1411,60 +1525,33 @@ def main_app():
         if S["refs"].get(name) is not None and not S["refs"][name]:
             st.warning("لم يُسترجع أي مرجع لهذا المكوّن — المحتوى إبداعي/عام ويحتاج مراجعة بشرية.")
 
-    # ---------------- generate all (sequential + paced: safe for free rate limits) ----------------
+    # ---------------- generate all (background job: the page stays interactive) ----------------
     if st.button("✨ ولّد كل شيء: تحليل + درس + أنشطة + لوحة + ورقة عمل + اختبار + مراجعة",
-                 type="primary", disabled=not can_run, key="gen_all", use_container_width=True):
-        steps = ORDER + ["validation"]
-        bar = st.progress(0.0, text="جاري البدء...")
-        finished = True
-        todo = [n for n in ORDER if not (S.get(n) and ss["skip_done"])]
-        eps0 = endpoints(ss["engine"], ss["auto_fb"])
-        fast = bool(eps0) and eps0[0].kind == "gemini" and len(todo) > 1   # Gemini has no 20/min cap -> run parts together
-        if fast:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            errs, done = {}, len(ORDER) - len(todo)
-            bar.progress(done / len(steps), text=f"⚡ توليد {len(todo)} أجزاء معًا ...")
-            with ThreadPoolExecutor(max_workers=3) as ex:
-                futs = {}
-                for n in todo:
-                    pv = provider()
-                    pv.on_model = None            # worker threads never touch Streamlit state
-                    futs[ex.submit(run_task, n, S, kb, pv)] = n
-                for fut in as_completed(futs):
-                    n = futs[fut]
-                    done += 1
-                    try:
-                        fut.result()
-                    except LLMError as e:
-                        errs[n] = e.msg_ar
-                    except Exception as e:
-                        errs[n] = redact(str(e), "".join(keys()))[:200]
-                    bar.progress(done / len(steps), text=f"اكتمل {done} من {len(ORDER)}: {TASKS[n][1]}")
-            for n, m in errs.items():
-                st.error(f"{TASKS[n][1]}: {m}")
-            finished = not errs
-            if finished:
-                bar.progress(len(ORDER) / len(steps), text="جاري المراجعة ...")
-                finished = guarded(lambda: run_validation(S, provider()), "جاري المراجعة...") is not None
-            else:
-                st.info("الأجزاء الناجحة محفوظة — اضغط الزر مرة أخرى لاستكمال الناقص فقط.")
-        else:
-            for i, name in enumerate(steps):
-                label = "المراجعة" if name == "validation" else TASKS[name][1]
-                if name != "validation" and S.get(name) and ss["skip_done"]:
-                    bar.progress((i + 1) / len(steps), text=f"✓ {label} (موجود بالفعل)")
-                    continue
-                bar.progress(i / len(steps), text=f"الخطوة {i + 1} من {len(steps)}: {label} ...")
-                if name == "validation":
-                    res = guarded(lambda: run_validation(S, provider()), f"جاري {label}...")
-                else:
-                    res = guarded(lambda n=name: run_task(n, S, kb, provider()), f"جاري توليد {label}...")
-                if res is None:
-                    finished = False
-                    st.info("توقف التوليد. الأجزاء الناجحة محفوظة — اضغط الزر مرة أخرى لاستكمال الناقص فقط.")
-                    break
-        bar.progress(1.0 if finished else 0.0, text="✅ اكتمل التوليد" if finished else "توقف التوليد")
+                 type="primary", disabled=not can_run or running, key="gen_all", use_container_width=True):
+        start_job(ORDER, True)
+        st.rerun()
     st.checkbox("عند إعادة الضغط، تخطَّ الأجزاء المولّدة بالفعل", key="skip_done")
+
+    def _job_view():
+        j = ss["job"]
+        st.progress(j.fraction(), text=j.text)
+        st.caption("⏳ التوليد يعمل في الخلفية — يمكنك التنقل واستخدام باقي الأدوات بحرية.")
+        if j.finished:
+            st.rerun()                       # refresh the whole page once, to show the results
+
+    if running:
+        if hasattr(st, "fragment"):
+            st.fragment(run_every=2)(_job_view)()
+        else:                                 # very old Streamlit: simple polling fallback
+            _job_view()
+            time.sleep(2)
+            st.rerun()
+    elif job:
+        st.progress(1.0 if job.ok else job.fraction(), text=job.text)
+        for k, m in job.errors.items():
+            st.error(f"{TASKS[k][1] if k in TASKS else 'المراجعة'}: {m}")
+        if job.errors:
+            st.info("الأجزاء الناجحة محفوظة — اضغط الزر مرة أخرى لاستكمال الناقص فقط.")
 
     # ---------------- results ----------------
     st.markdown('<div class="sec">📦 المحتوى</div>', unsafe_allow_html=True)
@@ -1473,15 +1560,18 @@ def main_app():
         with st.expander(f"{TASK_ICON[name]} {label} {'✅' if S.get(name) else ''}", expanded=bool(S.get(name))):
             c1, c2 = st.columns([3, 1])
             extra = c1.text_input("ملاحظة للتعديل (اختياري)", key=f"x_{name}")
-            if c2.button("🔄 إعادة توليد هذا الجزء فقط", key=f"b_{name}", disabled=not can_run):
-                guarded(lambda n=name, e=extra: run_task(n, S, kb, provider(), e), f"جاري توليد {label}...")
+            if c2.button("🔄 إعادة توليد هذا الجزء فقط", key=f"b_{name}", disabled=not can_run or running):
+                start_job([name], False, extra)
                 st.rerun()
+            if running:
+                c1.caption("⏳ جاري التوليد في الخلفية...")
             render(name)
 
     # ---------------- review ----------------
     st.markdown('<div class="sec">🛡️ المراجعة</div>', unsafe_allow_html=True)
-    if st.button("إعادة المراجعة", disabled=not has_engine, key="re_validate"):
-        guarded(lambda: run_validation(S, provider()), "جاري المراجعة...")
+    if st.button("إعادة المراجعة", disabled=not has_engine or running, key="re_validate"):
+        start_job([], True)
+        st.rerun()
     if S.get("validation"):
         v = S["validation"]
         n = len(v["issues"]) + len(v["unsupported_claims"])
@@ -1950,6 +2040,38 @@ def run_selftests() -> int:
             with ThreadPoolExecutor(max_workers=2) as ex:
                 list(ex.map(lambda a: go(*a), [("activities", self.ACT), ("quiz", quiz)]))
             self.assertTrue(S["activities"] and S["quiz"])
+
+        def test_scrub_leaks(self):
+            flags = []
+            out = scrub_leaks({"a": "حسب (source_tag: منهج) ثم [review_flags: التأكد من الدقة.] نص",
+                               "b": ["عنوان الدرس (source_tag)", "عادي"]}, flags)
+            blob = json.dumps(out, ensure_ascii=False)
+            self.assertNotIn("source_tag", blob)
+            self.assertNotIn("review_flags", blob)
+            self.assertEqual(flags, ["التأكد من الدقة."])
+            self.assertEqual(out["b"][1], "عادي")
+
+        def test_task_output_is_scrubbed(self):
+            leaky = json.dumps({"items": [{"title": "لعبة (source_tag: إبداع)", "description": "د [review_flags: تأكد]",
+                                           "steps": ["1"]}]}, ensure_ascii=False)
+            S = new_state()
+            S["input"] = "درس عن الصدق"
+            p, _ = self._prov([leaky])
+            run_task("activities", S, self._kb([]), p)
+            it = S["activities"]["items"][0]
+            self.assertEqual((it["title"], it["description"]), ("لعبة", "د"))
+            self.assertIn("تأكد", S["activities"]["review_flags"])
+
+        def test_background_job(self):
+            S = new_state()
+            S["input"] = "درس عن الصدق"
+            job = Job(1)
+            run_job(job, S, self._kb([]), lambda: self._prov([self.ACT])[0], ["activities"], False, True)
+            self.assertTrue(job.finished and job.ok and S["activities"])
+            self.assertEqual(job.fraction(), 1.0)
+            bad = Job(1)
+            run_job(bad, S, self._kb([]), lambda: LLMProvider([]), ["quiz"], False, True)
+            self.assertTrue(bad.finished and not bad.ok and "quiz" in bad.errors)
 
         def test_exports(self):
             S = new_state()
