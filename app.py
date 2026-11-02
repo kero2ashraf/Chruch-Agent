@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Church Lesson Creative Teaching Agent — مساعد مدارس الأحد الذكي   (FINAL · free engines)
-Streamlit UI + 4 free AI engines + source-aware retrieval + Coptic calendar
+Church Lesson Creative Teaching Agent — مساعد مدارس الأحد الذكي   (FINAL v9 · title-only helper · free engines · curriculum-style lesson)
+Streamlit UI + 3 free AI engines + source-aware retrieval + Coptic calendar
 + validation gate + DOCX/PDF export + built-in self-tests.
+
+NEW in v8: the full lesson follows the uploaded church curriculum format:
+   ❖ هدف الدرس  ❖ آية الدرس  ❖ أسئلة تمهيدية  ❖ الدرس (عامية مصرية، نقاط مرقمة)
+   Same layout on screen and in DOCX / PDF.
 
 Run app :  streamlit run app.py
 Run tests: python app.py --selftest        (no key / no internet needed)
@@ -15,7 +19,7 @@ Free engines (each falls back to the others automatically):
   3. Auto      -> OpenRouter's own free router "openrouter/free" (always-on safety net)
 
 Keys (env var, .env, or .streamlit/secrets.toml):
-  OPENROUTER_API_KEY   for engines 1, 3, 4
+  OPENROUTER_API_KEY   for engines 1, 3
   GEMINI_API_KEY       for engine 2          (optional GEMINI_MODEL_ID)
 """
 from __future__ import annotations
@@ -29,8 +33,11 @@ import math
 import os
 import re
 import sys
+import ipaddress
+import socket
 import threading
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -44,7 +51,7 @@ from pydantic import BaseModel, ValidationError, field_validator
 # 0. CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 APP_TITLE_AR = "مساعد مدارس الأحد الذكي"
-BUILD = "final-v7"
+BUILD = "final-v9"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 ROUTER_FREE = "openrouter/free"
@@ -55,6 +62,9 @@ DATA_DIR = os.environ.get("APP_DATA_DIR", "data")
 KB_CACHE_PATH = os.path.join(DATA_DIR, "kb_cache.json")
 USER_AGENT = "ChurchLessonAgent/1.0 (educational, respects robots.txt)"
 STALE_DAYS = 30
+CURRICULUM_FULL_CHARS = 9000      # a curriculum up to this size is sent to the model whole
+AUTO_FETCH_PAGES = 2             # pages per registered source on the automatic background fetch
+RETRIEVE_K = 8                   # curriculum-style lessons need more of the uploaded curriculum in context
 
 ENGINES = ["gemma", "gemini", "auto"]
 ENGINE_AR = {"gemma": "Gemma", "gemini": "Gemini", "auto": "تلقائي"}
@@ -575,29 +585,95 @@ def make_chunks(parsed: dict, url: str, kind: str, now: str, max_chars: int = 70
     return chunks
 
 
-class KnowledgeBase:
-    """Web pages are cached on disk (public data only). Uploaded curriculum stays in memory per session."""
+MAX_DOWNLOAD_BYTES = 8_000_000
 
-    def __init__(self, cache_path: str = KB_CACHE_PATH, http=requests, sleep=time.sleep, delay: float = 1.5):
+
+def safe_public_url(url: str, resolver=None) -> Tuple[bool, str]:
+    """Only public http(s) addresses may be fetched: blocks localhost, private/link-local IPs and bad schemes."""
+    p = urlparse((url or "").strip())
+    if p.scheme not in ("http", "https") or not p.netloc or not p.hostname:
+        return False, "الرابط غير صحيح — لازم يبدأ بـ http:// أو https://"
+    host = p.hostname.lower()
+    if host == "localhost" or host.endswith((".local", ".internal", ".localhost")):
+        return False, "هذا العنوان داخلي ولا يمكن جلبه."
+    try:
+        infos = (resolver or socket.getaddrinfo)(host, None)
+    except Exception:
+        return False, "تعذر العثور على الموقع — تأكد من كتابة الرابط."
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+        except ValueError:
+            return False, "عنوان الموقع غير صالح."
+        if not ip.is_global:
+            return False, "هذا العنوان داخلي/خاص ولا يمكن جلبه."
+    return True, ""
+
+
+def extract_doc_text(name: str, data: bytes) -> Tuple[str, str]:
+    """PDF / DOCX bytes -> (text, error_ar). Arabic presentation forms are normalised (NFKC)."""
+    lower = name.lower()
+    try:
+        if lower.endswith(".pdf"):
+            from pypdf import PdfReader
+            text = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(data)).pages)
+        elif lower.endswith(".docx"):
+            import docx
+            d = docx.Document(io.BytesIO(data))
+            text = "\n".join(p.text for p in d.paragraphs)
+        else:
+            return "", "نوع الملف غير مدعوم (PDF أو DOCX فقط)."
+    except Exception:
+        return "", "تعذر قراءة الملف (قد يكون تالفًا أو محميًا)."
+    text = unicodedata.normalize("NFKC", text)
+    if len(re.findall(r"[\u0600-\u06FF]", text)) < 50:
+        return "", "لم يُستخرج نص عربي كافٍ (قد يكون الملف ممسوحًا ضوئيًا)."
+    return text, ""
+
+
+def doc_text_to_parsed(title: str, canonical: str, text: str) -> dict:
+    return {"title": title, "canonical": canonical, "links": [],
+            "lines": [("p", ln.strip()) for ln in text.splitlines() if len(ln.strip()) >= 20]}
+
+
+class KnowledgeBase:
+    """Registered public pages are cached on disk (shared). Pages the user adds (session=True) and the uploaded
+    curriculum live in this session's memory only. Every URL passes `check_url` (public addresses only)."""
+
+    def __init__(self, cache_path: str = KB_CACHE_PATH, http=requests, sleep=time.sleep, delay: float = 1.5,
+                 check_url: Optional[Callable[[str], Tuple[bool, str]]] = None):
         self.cache_path, self.http, self.sleep, self.delay = cache_path, http, sleep, delay
+        self.check_url = check_url or safe_public_url
         self.pages: Dict[str, dict] = {}
         self._robots: Dict[str, Optional[robotparser.RobotFileParser]] = {}
+        self._lock = threading.RLock()
         self.load()
 
     def load(self):
         try:
             with open(self.cache_path, encoding="utf-8") as f:
-                self.pages = json.load(f)
+                data = json.load(f)
         except Exception:
-            self.pages = {}
+            data = {}
+        with self._lock:
+            self.pages = data if isinstance(data, dict) else {}
 
     def save(self):
+        """Atomic write; session-only pages (user links) are never written to disk."""
         try:
+            with self._lock:
+                shared = {u: p for u, p in self.pages.items() if not p.get("session")}
             os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
-            with open(self.cache_path, "w", encoding="utf-8") as f:
-                json.dump(self.pages, f, ensure_ascii=False)
+            tmp = f"{self.cache_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(shared, f, ensure_ascii=False)
+            os.replace(tmp, self.cache_path)
         except Exception as e:
             log.warning("could not save KB cache: %s", e)
+
+    def snapshot(self) -> List[Tuple[str, dict]]:
+        with self._lock:
+            return list(self.pages.items())
 
     def allowed(self, url: str) -> Tuple[bool, str]:
         p = urlparse(url)
@@ -620,41 +696,76 @@ class KnowledgeBase:
             return False, "robots.txt يمنع الجلب الآلي لهذه الصفحة"
         return True, ""
 
-    def _record(self, url, kind, name, status, error="", parsed=None, chunks=None):
-        self.pages[url] = {"url": url, "kind": kind, "name": name, "status": status, "error": error,
-                           "title": (parsed or {}).get("title", ""), "canonical": (parsed or {}).get("canonical", url),
-                           "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-                           "chunks": [asdict(c) for c in (chunks or [])]}
+    def _record(self, url, kind, name, status, error="", parsed=None, chunks=None, session=False):
+        rec = {"url": url, "kind": kind, "name": name, "status": status, "error": error,
+               "title": (parsed or {}).get("title", ""), "canonical": (parsed or {}).get("canonical", url),
+               "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+               "chunks": [asdict(c) for c in (chunks or [])]}
+        if session:
+            rec["session"] = True
+        with self._lock:
+            self.pages[url] = rec
 
-    def fetch_page(self, url: str, kind: str, name: str) -> Optional[dict]:
+    def fetch_page(self, url: str, kind: str, name: str, session: bool = False) -> Optional[dict]:
+        rec = lambda status, err, parsed=None, chunks=None: self._record(url, kind, name, status, err, parsed, chunks, session)
+        ok, why = self.check_url(url)
+        if not ok:
+            rec("unavailable", why)
+            return None
         ok, why = self.allowed(url)
         if not ok:
-            self._record(url, kind, name, "unavailable", why)
+            rec("unavailable", why)
             return None
         try:
             r = self.http.get(url, timeout=25, headers={"User-Agent": USER_AGENT})
+            final = getattr(r, "url", "") or url
+            if final != url:                       # redirects must also stay on public addresses
+                ok2, why2 = self.check_url(final)
+                if not ok2:
+                    rec("unavailable", why2)
+                    return None
             if r.status_code != 200:
-                self._record(url, kind, name, "unavailable", f"رمز الاستجابة {r.status_code}")
+                rec("unavailable", f"رمز الاستجابة {r.status_code}")
                 return None
-            if not r.encoding or r.encoding.lower() == "iso-8859-1":
-                r.encoding = r.apparent_encoding or "utf-8"
-            parsed = parse_html(r.text, url)
+            hdrs = getattr(r, "headers", None) or {}
+            try:
+                size = int(hdrs.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size > MAX_DOWNLOAD_BYTES:
+                rec("unavailable", "الملف كبير جدًا")
+                return None
+            ctype = str(hdrs.get("Content-Type", "")).lower()
+            path = urlparse(url).path.lower()
             now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+            if "pdf" in ctype or path.endswith(".pdf") or "wordprocessingml" in ctype or path.endswith(".docx"):
+                fname = os.path.basename(urlparse(url).path) or "document"
+                if not fname.lower().endswith((".pdf", ".docx")):
+                    fname += ".pdf" if "pdf" in ctype else ".docx"
+                text, err = extract_doc_text(fname, getattr(r, "content", b""))
+                if err:
+                    rec("unavailable", err)
+                    return None
+                parsed = doc_text_to_parsed(fname, url, text)
+            else:
+                if not r.encoding or r.encoding.lower() == "iso-8859-1":
+                    r.encoding = r.apparent_encoding or "utf-8"
+                parsed = parse_html(r.text, url)
             chunks = make_chunks(parsed, url, kind, now)
             if not chunks:
-                self._record(url, kind, name, "unavailable", "لا يوجد نص عربي مفيد في الصفحة", parsed)
+                rec("unavailable", "لا يوجد نص عربي مفيد في الصفحة", parsed)
                 return None
-            self._record(url, kind, name, "ok", "", parsed, chunks)
+            rec("ok", "", parsed, chunks)
             return parsed
         except Exception as e:
-            self._record(url, kind, name, "unavailable", redact(str(e))[:150])
+            rec("unavailable", redact(str(e))[:150])
             return None
         finally:
             self.sleep(self.delay)
 
-    def ingest(self, src: dict, discover: bool = True, max_pages: int = 5) -> int:
+    def ingest(self, src: dict, discover: bool = True, max_pages: int = 5, session: bool = False) -> int:
         """Fetch the start page + a *bounded* number of same-section links. Not a full crawl."""
-        parsed = self.fetch_page(src["url"], src["kind"], src["name"])
+        parsed = self.fetch_page(src["url"], src["kind"], src["name"], session)
         n = 1 if parsed else 0
         if parsed and discover and max_pages > 1:
             base_dir = src["url"].rsplit("/", 1)[0] + "/"
@@ -666,48 +777,43 @@ class KnowledgeBase:
                 if link in seen or not link.startswith(base_dir) or not re.search(r"\.html?$", link):
                     continue
                 seen.add(link)
-                if self.fetch_page(link, src["kind"], src["name"]):
+                if self.fetch_page(link, src["kind"], src["name"], session):
                     n += 1
         self.save()
         return n
 
     def remove(self, url: str):
-        self.pages.pop(url, None)
+        with self._lock:
+            self.pages.pop(url, None)
         self.save()
 
     def is_stale(self, page: dict) -> bool:
+        """Good pages go stale after STALE_DAYS; failed ones are retried after one day."""
         try:
             t = dt.datetime.fromisoformat(page["retrieved_at"])
-            return (dt.datetime.now(dt.timezone.utc) - t).days > STALE_DAYS
+            limit = STALE_DAYS if page.get("status") == "ok" else 1
+            return (dt.datetime.now(dt.timezone.utc) - t).total_seconds() > limit * 86400
         except Exception:
             return True
 
     def web_chunks(self) -> List[Chunk]:
-        return [Chunk(**c) for p in self.pages.values() if p["status"] == "ok" for c in p["chunks"]]
+        with self._lock:
+            return [Chunk(**c) for p in self.pages.values() if p["status"] == "ok" for c in p["chunks"]]
 
     def stats(self) -> dict:
-        ok = sum(1 for p in self.pages.values() if p["status"] == "ok")
-        return {"ok": ok, "failed": len(self.pages) - ok,
-                "chunks": sum(len(p["chunks"]) for p in self.pages.values())}
+        with self._lock:
+            ps = list(self.pages.values())
+        ok = sum(1 for p in ps if p["status"] == "ok")
+        return {"ok": ok, "failed": len(ps) - ok, "chunks": sum(len(p["chunks"]) for p in ps)}
 
 
 def local_doc_to_chunks(name: str, data: bytes) -> Tuple[List[Chunk], str]:
     """PDF / DOCX curriculum -> chunks (kept in session memory only)."""
-    text = ""
-    if name.lower().endswith(".pdf"):
-        from pypdf import PdfReader
-        text = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(data)).pages)
-    elif name.lower().endswith(".docx"):
-        import docx
-        d = docx.Document(io.BytesIO(data))
-        text = "\n".join(p.text for p in d.paragraphs)
-    else:
-        return [], "نوع الملف غير مدعوم (PDF أو DOCX فقط)."
-    if len(re.findall(r"[\u0600-\u06FF]", text)) < 50:
-        return [], "لم يُستخرج نص عربي كافٍ (قد يكون الملف ممسوحًا ضوئيًا)."
+    text, err = extract_doc_text(name, data)
+    if err:
+        return [], err
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    parsed = {"title": name, "canonical": f"local:{name}",
-              "lines": [("p", ln.strip()) for ln in text.splitlines() if len(ln.strip()) >= 20]}
+    parsed = doc_text_to_parsed(name, f"local:{name}", text)
     ch = make_chunks(parsed, f"local:{name}", "sunday_school", now)
     for c in ch:
         c.origin, c.verification = "curriculum", "منهج معتمد مرفوع من المشغّل"
@@ -715,7 +821,7 @@ def local_doc_to_chunks(name: str, data: bytes) -> Tuple[List[Chunk], str]:
 
 
 def retrieve(query: str, chunks: List[Chunk], k: int = 5, min_score: float = 0.5) -> List[Chunk]:
-    """BM25 over normalized Arabic tokens. Curriculum chunks get a boost. k=5 keeps prompts lean for free models."""
+    """BM25 over normalized Arabic tokens. Curriculum chunks get a boost."""
     q = tokens(query)
     if not q or not chunks:
         return []
@@ -848,10 +954,14 @@ class LessonSection(BaseModel):
 
 
 class Lesson(BaseModel):
+    """Curriculum-style lesson: هدف الدرس / آية الدرس / أسئلة تمهيدية / الدرس.
+    Old-format data (title, objectives, sections, memory_verse, conclusion) still validates."""
     title: str
-    objectives: List[str]
-    sections: List[LessonSection]
-    memory_verse: str = ""
+    main_idea: str = ""                      # the key sentence under «هدف الدرس»
+    objectives: List[str] = []               # completes «مساعدة الطفل أن:»
+    memory_verse: str = ""                   # آية الدرس (from references only) + its reference
+    intro_questions: List[str] = []          # أسئلة تمهيدية للدرس
+    sections: List[LessonSection]            # «الدرس»: body = numbered/bulleted lines
     conclusion: str = ""
     review_flags: List[str] = []
 
@@ -906,8 +1016,17 @@ UNSAFE_WORDS = ["نار", "لهب", "كبريت", "ولاعة", "سكين", "م�
 
 
 def local_safety_scan(text: str) -> List[Issue]:
-    return [Issue(severity="critical", text=f"كلمة تدل على خطر محتمل: «{w}» — يلزم تعديل النشاط أو مراجعته.")
-            for w in UNSAFE_WORDS if w in text]
+    """Whole-word match (with و/ف/ب/ل/ك + ال prefixes), so «منارة» is not flagged for «نار»."""
+    toks = [ar_norm(t) for t in re.findall(r"[\u0600-\u06FF]+", text or "")]
+    stems = {re.sub(r"^[وفبلك]?(?:ال)?", "", t) for t in toks} | set(toks)
+    flat = " ".join(toks)
+    out = []
+    for w in UNSAFE_WORDS:
+        wn = ar_norm(w)
+        hit = (wn in flat) if " " in wn else (wn in stems)
+        if hit:
+            out.append(Issue(severity="critical", text=f"كلمة تدل على خطر محتمل: «{w}» — يلزم تعديل النشاط أو مراجعته."))
+    return out
 
 
 def gate(v: Validation, extra: Optional[List[Issue]] = None) -> Tuple[str, List[Issue]]:
@@ -930,13 +1049,29 @@ SYSTEM_BASE = (
     "اقتبس فقط من المراجع المرفقة، واذكر رقم المرجع بالشكل [م1]. (3) ميّز بين: منهج / مرجع / شرح / إبداع / مراجعة عبر source_tag. "
     "(4) إن لم تتأكد من معلومة عقائدية أو تاريخية ضعها في review_flags. (5) إن اختلفت المراجع لا تدمجها؛ اذكر الاختلاف. "
     "(6) الأنشطة آمنة تمامًا للأطفال: بلا نار أو أدوات حادة أو مواد خطرة. (7) لا تذكر الأعياد إلا إذا كانت ذات صلة بالطلب. "
-    "(8) كن موجزًا ومحدد البنية. (9) لا تكتب أسماء الحقول التقنية (source_tag, review_flags, refs) داخل النصوص إطلاقًا؛ ضع قيمها في حقولها المخصصة فقط."
+    "(8) كن موجزًا ومحدد البنية. (9) لا تكتب أسماء الحقول التقنية (source_tag, review_flags, refs) داخل النصوص إطلاقًا؛ ضع قيمها في حقولها المخصصة فقط. "
+    "(10) في الدرس الكامل اكتب بالعامية المصرية المبسطة بنفس أسلوب ملف المنهج المرفوع، وحافظ على ترتيب وعناوين أقسامه. "
+    "(11) أنت مساعد للخادم فقط: كل ما تكتبه مسودة اقتراحات يراجعها الخادم ويقرّها ويعدّلها، ولا تتصرف كمرجع نهائي."
 )
 CHAT_SYSTEM = SYSTEM_BASE + " في المحادثة تكلم مع الخادم بالعامية المصرية الودودة، واقترح أفكارًا عملية وبسيطة الخامات، واسأل سؤالًا واحدًا فقط عند الحاجة."
 
+LESSON_INSTR = (
+    "اكتب الدرس بنفس بنية ملف المنهج المرفق في المراجع بالضبط:\n"
+    "1) title: عنوان قصير.\n"
+    "2) main_idea: جملة واحدة تلخص فكرة الدرس (مثل: «الكنيسة هي ملكوت السموات على الأرض»).\n"
+    "3) objectives: 3 أهداف تبدأ بفعل مضارع، تكمل جملة «مساعدة الطفل أن: يعرف.. / يشعر.. / يتدرب..».\n"
+    "4) memory_verse: آية الدرس مع رقمها، فقط إن وردت نصًا في المراجع؛ وإلا اتركها فارغة وضع ذلك في review_flags.\n"
+    "5) intro_questions: 4 إلى 5 أسئلة تمهيدية قصيرة بالعامية المصرية تفتح النقاش.\n"
+    "6) sections: أقسام «الدرس». القسم الأول مدخل بسيط، ثم أقسام للنقاط الرئيسية. داخل body اكتب كل نقطة في سطر مستقل "
+    "مرقمًا هكذا «1. العنوان: الشرح» أو بشرطة «- » للتفاصيل، واشرح رمزية كل شيء بـ«لأن...».\n"
+    "الأسلوب: عامية مصرية مبسطة للأطفال كما في ملف المنهج، جمل قصيرة. التزم بمعلومات المراجع (منهج الكنيسة المرفوع) "
+    "ولا تضف رمزيات أو تفاصيل غير واردة فيها؛ أي إضافة ضعها في review_flags. "
+    "إن لم يوجد منهج مرفوع، اكتب بنفس البنية مع تنبيه في review_flags أن المحتوى يحتاج مراجعة."
+)
+
 TASKS: Dict[str, Tuple[type, str, str]] = {
     "analysis": (Analysis, "تحليل الدرس", "حلل الدرس: الموضوع، هل هو مناسبة كنسية، الرسالة الأساسية، أهداف التعلم، الشواهد (من المراجع فقط)."),
-    "lesson": (Lesson, "الدرس الكامل", "اكتب خطة درس كاملة (مقدمة، قصة/شرح، تطبيق، ختام) بأقسام واضحة وآية حفظ إن وردت في المراجع."),
+    "lesson": (Lesson, "الدرس الكامل", LESSON_INSTR),
     "activities": (Activities, "الأنشطة", "اقترح 4 أنشطة وألعاب إبداعية متنوعة وآمنة (حركية، فنية، جماعية، تأملية) بخامات بسيطة."),
     "poster": (Poster, "اللوحة التعليمية", "صمم لوحة/وسيلة إيضاح تفاعلية بخامات بسيطة: التصميم، الخامات، خطوات التنفيذ، سكريبت الشرح، مشاركة الأطفال، أسئلة نقاش."),
     "worksheet": (Worksheet, "ورقة العمل", "أنشئ ورقة عمل قابلة للطباعة من 5 تمارين متنوعة (توصيل، إكمال، ترتيب، رسم) مع الإجابة النموذجية في حقل answer."),
@@ -952,10 +1087,15 @@ def new_state() -> dict:
 
 
 def retrieve_for(state: dict, kb: KnowledgeBase, extra: str = "") -> Tuple[List[Chunk], Optional[dict]]:
+    """A short uploaded curriculum goes to the model WHOLE (a title-only query can't miss parts of it);
+    a long one is searched with BM25. Web references are always searched."""
     q = f"{state['input']} {extra}"
     occ = find_occasion(q)
-    pool = list(state["curriculum_chunks"]) + kb.web_chunks()
-    return retrieve(q + (" " + occ["name"] if occ else ""), pool), occ
+    query = q + (" " + occ["name"] if occ else "")
+    cur = list(state["curriculum_chunks"])
+    if cur and sum(len(c.text) for c in cur) <= CURRICULUM_FULL_CHARS:
+        return cur + retrieve(query, kb.web_chunks(), k=3), occ
+    return retrieve(query, cur + kb.web_chunks(), k=RETRIEVE_K), occ
 
 
 def run_task(name: str, state: dict, kb: KnowledgeBase, provider: LLMProvider, extra: str = "") -> Any:
@@ -994,7 +1134,8 @@ def run_validation(state: dict, provider: LLMProvider) -> dict:
     user = (f"راجع المحتوى التالي لدرس مدارس الأحد (8–10 سنوات): مطابقة لتعليم الكنيسة، سلامة الأنشطة، مناسبة العمر، "
             f"وادعاءات غير مدعومة بالمراجع. كن صارمًا.\nالمراجع:\n{build_context(chunks[:8], state.get('occasion'))}\n\nالمحتوى:\n{flat[:8000]}")
     v = provider.structured(Validation, [{"role": "system", "content": SYSTEM_BASE}, {"role": "user", "content": user}], temperature=0.2)
-    extra = local_safety_scan(flat)
+    hands_on = json.dumps({k: state[k] for k in ('activities', 'poster', 'worksheet') if state.get(k)}, ensure_ascii=False)
+    extra = local_safety_scan(hands_on)      # fire/knives are only a hazard in hands-on parts, not in lesson text
     # Quote check runs in the BACKEND only: logged and stored, never shown in the UI or used by the gate
     # (it flags every «...» phrase, including the model's own activity text, so it was mostly noise).
     notes = [q[:120] for q in unverified_quotes(flat, chunks)]
@@ -1070,9 +1211,66 @@ def run_job(job: Job, S: dict, kb: KnowledgeBase, make_provider: Callable[[], LL
         job.finished = True
 
 
+def run_fetch(job: Job, kb: KnowledgeBase, sources: List[dict], discover: bool = True,
+              max_pages: int = 3, session: bool = False):
+    """Background web fetching (never blocks the UI). Never raises."""
+    try:
+        for s in sources:
+            job.update(f"جاري جلب {s['name']} ...")
+            try:
+                kb.ingest(s, discover, max_pages, session)
+            except Exception as e:
+                job.errors[s["name"]] = redact(str(e))[:150]
+            job.update(inc=1)
+    except Exception as e:
+        job.errors["fetch"] = redact(str(e))[:150]
+    finally:
+        job.ok = not job.errors
+        job.text = "✅ اكتمل الجلب" if job.ok else "اكتمل الجلب مع أخطاء"
+        job.finished = True
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 6. RENDER BLOCKS + EXPORTS (DOCX / PDF, Arabic RTL)
 # ════════════════════════════════════════════════════════════════════════════
+_NUM_LINE = re.compile(r"^\s*(\d+|[١-٩]+)\s*[\.\-\)]\s*")
+_BUL_LINE = re.compile(r"^\s*[-•▪]\s*")
+
+
+def lesson_blocks(d: dict) -> List[Tuple[str, str]]:
+    """Same layout as the church curriculum file:
+    ❖ هدف الدرس / ❖ آية الدرس / ❖ أسئلة تمهيدية للدرس / ❖ الدرس."""
+    B: List[Tuple[str, str]] = [("h1", d.get("title", "")), ("h2", "❖ هدف الدرس")]
+    if d.get("main_idea"):
+        B.append(("p", d["main_idea"]))
+    if d.get("objectives"):
+        B.append(("p", "مساعدة الطفل أن:"))
+        B += [("li", o) for o in d["objectives"]]
+    if d.get("memory_verse"):
+        B += [("h2", "❖ آية الدرس"), ("p", d["memory_verse"])]
+    if d.get("intro_questions"):
+        B.append(("h2", "❖ أسئلة تمهيدية للدرس"))
+        B += [("li", q) for q in d["intro_questions"]]
+    B.append(("h2", "❖ الدرس"))
+    for s in d.get("sections", []):
+        tag = s.get("source_tag", "")
+        if s.get("heading"):
+            B.append(("h3", s["heading"] + (f" [{tag}]" if tag in ("إبداع", "مراجعة") else "")))
+        for line in str(s.get("body", "")).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if _NUM_LINE.match(line):
+                B.append(("p", line))
+            elif _BUL_LINE.match(line):
+                B.append(("li", _BUL_LINE.sub("", line)))
+            else:
+                B.append(("p", line))
+    if d.get("conclusion"):
+        B += [("h3", "الختام"), ("p", d["conclusion"])]
+    return B
+
+
 def component_blocks(name: str, d: dict, answers: bool = False) -> List[Tuple[str, str]]:
     B: List[Tuple[str, str]] = []
     tag = lambda x: f"[{x.get('source_tag')}] " if x.get("source_tag") else ""
@@ -1082,13 +1280,7 @@ def component_blocks(name: str, d: dict, answers: bool = False) -> List[Tuple[st
         if d.get("bible_refs"):
             B += [("h3", "الشواهد")] + [("li", x) for x in d["bible_refs"]]
     elif name == "lesson":
-        B += [("h1", d["title"]), ("h3", "أهداف الدرس")] + [("li", o) for o in d["objectives"]]
-        for s in d["sections"]:
-            B += [("h2", s["heading"]), ("p", tag(s) + s["body"])]
-        if d.get("memory_verse"):
-            B += [("h3", "آية الحفظ"), ("p", d["memory_verse"])]
-        if d.get("conclusion"):
-            B += [("h3", "الختام"), ("p", d["conclusion"])]
+        B = lesson_blocks(d)
     elif name == "activities":
         B.append(("h1", "الأنشطة"))
         for a in d["items"]:
@@ -1129,7 +1321,7 @@ def refs_blocks(state: dict) -> List[Tuple[str, str]]:
     return B if len(B) > 1 else []
 
 
-def export_sets(state: dict) -> Dict[str, List[Tuple[str, str]]]:
+def export_sets(state: dict, approved: bool = True) -> Dict[str, List[Tuple[str, str]]]:
     lesson = []
     for k in ("lesson", "activities", "poster"):
         if state.get(k):
@@ -1137,6 +1329,8 @@ def export_sets(state: dict) -> Dict[str, List[Tuple[str, str]]]:
     lesson += refs_blocks(state)
     if state.get("gate") in ("blocked", "needs_review"):
         lesson.insert(0, ("p", "تنبيه: هذا المحتوى يحتاج مراجعة بشرية قبل الاستخدام."))
+    elif not approved:
+        lesson.insert(0, ("p", "مسودة اقتراحات من المساعد — لم تُراجَع بعد، وتحتاج مراجعة الخادم قبل الاستخدام."))
     student = []
     for k in ("worksheet", "quiz"):
         if state.get(k):
@@ -1389,8 +1583,9 @@ def main_app():
 
     ss = st.session_state
     ss.setdefault("S", new_state())
-    ss.setdefault("auto_fb", True)
-    ss.setdefault("skip_done", True)
+    for k, v in (("auto_fb", True), ("skip_done", True), ("approved", False), ("title", ""), ("notes", ""),
+                 ("link_url", ""), ("link_follow", False)):
+        ss.setdefault(k, v)
     if "kb" not in ss:
         ss["kb"] = KnowledgeBase()
     if "free_map" not in ss:
@@ -1427,17 +1622,48 @@ def main_app():
     def start_job(names: List[str], validate: bool, extra: str = ""):
         """Runs generation in a background thread so every widget keeps working meanwhile."""
         eps = endpoints(ss["engine"], ss["auto_fb"])
-        site, app = get_secret("OPENROUTER_SITE_URL"), get_secret("OPENROUTER_APP_NAME", "Church Lesson Creative Teaching Agent")
+        site, app_name = get_secret("OPENROUTER_SITE_URL"), get_secret("OPENROUTER_APP_NAME", "Church Lesson Creative Teaching Agent")
         job = Job(len(names) + (1 if validate else 0))
-        make = lambda: LLMProvider(eps, site_url=site, min_interval=FREE_MIN_INTERVAL, app_name=app,
+        make = lambda: LLMProvider(eps, site_url=site, min_interval=FREE_MIN_INTERVAL, app_name=app_name,
                                    on_model=lambda m: setattr(job, "last_model", m))
         fast = bool(eps) and eps[0].kind == "gemini"      # Gemini has no 20/min cap -> run parts together
+        ss["approved"] = False                            # new content -> the teacher must approve again
         ss["job"] = job
         threading.Thread(target=run_job, args=(job, S, kb, make, names, validate, ss["skip_done"], extra, fast),
                          daemon=True).start()
 
-    job = ss.get("job")
+    def start_fetch(sources: List[dict], discover: bool, max_pages: int, session: bool = False):
+        fj = Job(len(sources))
+        ss["fjob"] = fj
+        threading.Thread(target=run_fetch, args=(fj, kb, sources, discover, max_pages, session), daemon=True).start()
+
+    def new_lesson():
+        ss["S"] = new_state()
+        ss["title"], ss["notes"], ss["approved"] = "", "", False
+
+    def add_link():
+        raw = (ss.get("link_url") or "").strip()
+        if not raw:
+            ss["link_msg"] = ("warn", "اكتب الرابط أولًا.")
+            return
+        ok, why = kb.check_url(raw)
+        if not ok:
+            ss["link_msg"] = ("err", why)
+            return
+        start_fetch([{"url": raw, "kind": "general", "name": urlparse(raw).netloc}], bool(ss.get("link_follow")), 3, True)
+        ss["link_msg"] = ("ok", "بدأ جلب الرابط في الخلفية — تابع حالته في القائمة أدناه. (يبقى في جلستك فقط)")
+        ss["link_url"] = ""
+
+    # Registered sources are fetched once per session in the background (shared cache, polite pacing).
+    if not ss.get("auto_fetched"):
+        ss["auto_fetched"] = True
+        todo = [s for s in REGISTERED_SOURCES if s["url"] not in kb.pages or kb.is_stale(kb.pages[s["url"]])]
+        if todo:
+            start_fetch(todo, True, AUTO_FETCH_PAGES)
+
+    job, fjob = ss.get("job"), ss.get("fjob")
     running = bool(job and not job.finished)
+    fetching = bool(fjob and not fjob.finished)
 
     ork, gk = keys()
     status = engine_status(ss["free_map"], ork, gk)
@@ -1470,46 +1696,68 @@ def main_app():
                     st.write(f"❌ {ENGINE_AR[n]} — {e.msg_ar[:160]}")
         st.caption("الحد المجاني على OpenRouter ≈ 20 طلب/دقيقة، لذلك يبطّئ التطبيق طلباته عبره فقط.")
         st.divider()
-        if st.button("🗑️ بدء درس جديد", disabled=running):
-            ss["S"] = new_state()
-            st.rerun()
+        st.button("🗑️ بدء درس جديد", disabled=running, on_click=new_lesson)
 
     # ---------------- hero ----------------
     st.markdown(f"""<div class="hero"><h1>✝️ {APP_TITLE_AR}</h1>
-      <p>خطط درسك، أنشطتك، لوحتك التعليمية وأوراق الأطفال في دقائق — لأطفال 8–10 سنوات</p>
-      <div class="chips"><span class="chip">🆓 نماذج مجانية فقط</span><span class="chip">📚 يعتمد على منهج الكنيسة</span>
+      <p>اكتب عنوان الدرس والمساعد يجهّز لك مسودة: درس، أنشطة، لوحة، ورقة عمل واختبار — لأطفال 8–10 سنوات</p>
+      <div class="chips"><span class="chip">🤝 مساعد فقط — القرار ليك</span><span class="chip">📚 يعتمد على منهج الكنيسة</span>
       <span class="chip">🛡️ مراجعة عقيدة وأمان</span><span class="chip">📤 DOCX / PDF</span></div></div>""",
                 unsafe_allow_html=True)
 
-    # ---------------- engine selector ----------------
-    st.markdown('<div class="sec">🧠 اختر المحرّك المجاني</div>', unsafe_allow_html=True)
-    cols = st.columns(3)
-    for col, n in zip(cols, ENGINES):
-        ok, note = status[n]
-        cls = ("sel " if ss["engine"] == n else "") + ("" if ok else "off")
-        col.markdown(f"""<div class="ecard {cls}"><div class="t">{ENGINE_ICON[n]} {ENGINE_AR[n]}
-          <span class="pill {'ok' if ok else 'off'}">{'جاهز' if ok else 'غير متاح'}</span></div>
-          <div class="n">{note}</div></div>""", unsafe_allow_html=True)
-    st.radio("المحرّك", ENGINES, key="engine", horizontal=True, format_func=lambda n: f"{ENGINE_ICON[n]} {ENGINE_AR[n]}",
-             label_visibility="collapsed")
-    if job and job.last_model:
-        ss["last_model"] = job.last_model
-    if ss.get("last_model"):
-        st.caption(f"آخر نموذج استجاب: {ss['last_model']}")
+    # ---------------- engine (advanced, collapsed) ----------------
     has_engine = bool(endpoints(ss["engine"], ss["auto_fb"]))
-    if has_engine and not status[ss["engine"]][0] and ss["auto_fb"]:
-        st.info("هذا المحرّك غير متاح الآن — سيُستخدم أول محرّك متاح تلقائيًا.")
+    with st.expander("🧠 المحرّك المجاني (متقدم)"):
+        cols = st.columns(3)
+        for col, n in zip(cols, ENGINES):
+            ok, note = status[n]
+            cls = ("sel " if ss["engine"] == n else "") + ("" if ok else "off")
+            col.markdown(f"""<div class="ecard {cls}"><div class="t">{ENGINE_ICON[n]} {ENGINE_AR[n]}
+              <span class="pill {'ok' if ok else 'off'}">{'جاهز' if ok else 'غير متاح'}</span></div>
+              <div class="n">{note}</div></div>""", unsafe_allow_html=True)
+        st.radio("المحرّك", ENGINES, key="engine", horizontal=True, format_func=lambda n: f"{ENGINE_ICON[n]} {ENGINE_AR[n]}",
+                 label_visibility="collapsed")
+        if job and job.last_model:
+            ss["last_model"] = job.last_model
+        if ss.get("last_model"):
+            st.caption(f"آخر نموذج استجاب: {ss['last_model']}")
+        if has_engine and not status[ss["engine"]][0] and ss["auto_fb"]:
+            st.info("هذا المحرّك غير متاح الآن — سيُستخدم أول محرّك متاح تلقائيًا.")
     if not has_engine:
         st.warning("لا يوجد محرّك جاهز: مفاتيح الخادم غير مضبوطة (OPENROUTER_API_KEY / GEMINI_API_KEY).")
 
-    # ---------------- lesson input ----------------
-    st.markdown('<div class="sec">📝 وصف الدرس</div>', unsafe_allow_html=True)
-    S["input"] = st.text_area("وصف الدرس أو طلبك", value=S["input"], height=110, label_visibility="collapsed",
-                              placeholder="عندي درس عن عيد الرسل. عايز لوحة وأنشطة لتالتة ورابعة ابتدائي.")
-    can_run = has_engine and bool(S["input"].strip())
+    st.info("🤝 المساعد بيقترح مسودة بس — أنت اللي بتراجع وتعدّل وتقرر قبل ما تستخدم أي حاجة.")
+
+    # ---------------- 1) lesson title ----------------
+    st.markdown('<div class="sec">📝 عنوان الدرس</div>', unsafe_allow_html=True)
+    st.text_input("عنوان الدرس", key="title", placeholder="مثال: الكنيسة", label_visibility="collapsed")
+    with st.expander("➕ تفاصيل إضافية (اختياري)"):
+        st.text_area("ملاحظات", key="notes", height=90, label_visibility="collapsed",
+                     placeholder="مثال: عايز لوحة وأنشطة لتالتة ورابعة ابتدائي")
+    notes = ss["notes"].strip()
+    S["input"] = (ss["title"].strip() + ("\n" + notes if notes else "")).strip()
+    can_run = has_engine and bool(S["input"])
     occ = find_occasion(S["input"]) if S["input"] else None
     if occ:
         st.info(f"مناسبة مرصودة: **{occ['name']}** ({occ['kind']}) — {occ['date'].isoformat()} — {occ['note']}")
+
+    # ---------------- 2) curriculum upload ----------------
+    st.markdown('<div class="sec">📚 منهج الدرس (موصى به)</div>', unsafe_allow_html=True)
+    ups = st.file_uploader("ارفع ملف المنهج PDF أو DOCX", type=["pdf", "docx"], accept_multiple_files=True,
+                           label_visibility="collapsed")
+    for f in ups or []:
+        if f.name not in S["curriculum_names"]:
+            ch, err = local_doc_to_chunks(f.name, f.getvalue())
+            if err:
+                st.error(f"{f.name}: {err}")
+            else:
+                S["curriculum_chunks"] += ch
+                S["curriculum_names"].append(f.name)
+    if S["curriculum_names"]:
+        st.success("المنهج المحمّل: " + "، ".join(S["curriculum_names"]))
+    else:
+        st.caption("بدون ملف منهج هيعتمد المساعد على المراجع الإلكترونية فقط، وهيطلب منك مراجعة أدق. "
+                   "المنهج المرفوع يبقى في ذاكرة الجلسة فقط ولا يُحفظ على القرص.")
 
     ORDER = ["analysis", "lesson", "activities", "poster", "worksheet", "quiz"]
 
@@ -1525,17 +1773,19 @@ def main_app():
         if S["refs"].get(name) is not None and not S["refs"][name]:
             st.warning("لم يُسترجع أي مرجع لهذا المكوّن — المحتوى إبداعي/عام ويحتاج مراجعة بشرية.")
 
-    # ---------------- generate all (background job: the page stays interactive) ----------------
-    if st.button("✨ ولّد كل شيء: تحليل + درس + أنشطة + لوحة + ورقة عمل + اختبار + مراجعة",
-                 type="primary", disabled=not can_run or running, key="gen_all", use_container_width=True):
+    # ---------------- 3) generate (background job: the page stays interactive) ----------------
+    if st.button("✨ ساعدني في تحضير الدرس", type="primary", disabled=not can_run or running,
+                 key="gen_all", use_container_width=True):
         start_job(ORDER, True)
         st.rerun()
+    if not S["input"]:
+        st.caption("اكتب عنوان الدرس أولًا ثم اضغط الزر.")
     st.checkbox("عند إعادة الضغط، تخطَّ الأجزاء المولّدة بالفعل", key="skip_done")
 
     def _job_view():
         j = ss["job"]
         st.progress(j.fraction(), text=j.text)
-        st.caption("⏳ التوليد يعمل في الخلفية — يمكنك التنقل واستخدام باقي الأدوات بحرية.")
+        st.caption("⏳ المساعد شغال في الخلفية — تقدر تتصفح وتستخدم باقي الأدوات.")
         if j.finished:
             st.rerun()                       # refresh the whole page once, to show the results
 
@@ -1554,7 +1804,7 @@ def main_app():
             st.info("الأجزاء الناجحة محفوظة — اضغط الزر مرة أخرى لاستكمال الناقص فقط.")
 
     # ---------------- results ----------------
-    st.markdown('<div class="sec">📦 المحتوى</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec">📦 المسودة</div>', unsafe_allow_html=True)
     for name in ORDER:
         _, label, _ = TASKS[name]
         with st.expander(f"{TASK_ICON[name]} {label} {'✅' if S.get(name) else ''}", expanded=bool(S.get(name))):
@@ -1592,9 +1842,12 @@ def main_app():
     else:
         st.caption("أي إعادة توليد تُبطل نتيجة المراجعة السابقة.")
 
-    # ---------------- export ----------------
+    # ---------------- export (teacher approval controls the draft notice) ----------------
     st.markdown('<div class="sec">📤 التصدير</div>', unsafe_allow_html=True)
-    sets = export_sets(S)
+    has_content = any(S.get(k) for k in TASKS)
+    if has_content:
+        st.checkbox("✅ راجعت المحتوى بنفسي وأقرّه للاستخدام (بدونها يُكتب على الملف «مسودة تحتاج مراجعة»)", key="approved")
+    sets = export_sets(S, bool(ss["approved"]))
     if S.get("gate") == "blocked":
         st.error("المحتوى مرفوض في المراجعة — التصدير يتضمن تنبيهًا. عدّله أولًا.")
     if not sets:
@@ -1619,8 +1872,6 @@ def main_app():
         if msg:
             S["chat"].append({"role": "user", "content": msg})
             st.chat_message("user").markdown(msg)
-            if not S["input"].strip():
-                S["input"] = msg
             chunks, o = retrieve_for(S, kb, msg)
             hist = [{"role": m["role"], "content": m["content"]} for m in S["chat"][-8:]]
             sysmsg = CHAT_SYSTEM + "\n\nالمراجع المسترجعة:\n" + build_context(chunks, o)
@@ -1629,49 +1880,53 @@ def main_app():
                 S["chat"].append({"role": "assistant", "content": ans})
                 st.chat_message("assistant").markdown(ans)
 
-    # ---------------- sources ----------------
-    with st.expander("📚 المراجع والمنهج"):
-        st.subheader("منهج الكنيسة (المصدر الأساسي)")
-        ups = st.file_uploader("ارفع دروسًا معتمدة PDF أو DOCX", type=["pdf", "docx"], accept_multiple_files=True)
-        for f in ups or []:
-            if f.name not in S["curriculum_names"]:
-                ch, err = local_doc_to_chunks(f.name, f.getvalue())
-                if err:
-                    st.error(f"{f.name}: {err}")
-                else:
-                    S["curriculum_chunks"] += ch
-                    S["curriculum_names"].append(f.name)
-                    st.success(f"{f.name}: {len(ch)} مقطع")
-        st.caption("المنهج المرفوع يبقى في ذاكرة هذه الجلسة فقط ولا يُحفظ على القرص.")
-        st.divider()
-        st.subheader("المراجع الإلكترونية")
-        mp = st.slider("أقصى عدد صفحات لكل مصدر (لا يتم زحف الموقع كاملًا)", 1, 10, 3)
-        if st.button("⬇️ جلب المصادر المسجلة"):
-            for src in REGISTERED_SOURCES:
-                guarded(lambda s=src: kb.ingest(s, True, mp), f"جلب {src['name']}...")
+    # ---------------- web sources ----------------
+    def _fetch_view():
+        j = ss["fjob"]
+        st.progress(j.fraction(), text=j.text)
+        if j.finished:
+            st.rerun()
+
+    with st.expander("🌐 المراجع الإلكترونية"):
+        st.caption("المصادر المسجلة تُجلب تلقائيًا في الخلفية أول مرة، وتُحدَّث إذا قدمت. الجلب يحترم robots.txt ولا يزحف الموقع كاملًا.")
+        mp = st.slider("أقصى عدد صفحات لكل مصدر", 1, 10, 3)
+        if st.button("⬇️ جلب/تحديث المصادر المسجلة", disabled=fetching):
+            start_fetch(REGISTERED_SOURCES, True, mp)
+            st.rerun()
+        if fetching:
+            if hasattr(st, "fragment"):
+                st.fragment(run_every=2)(_fetch_view)()
+            else:
+                st.caption("⏳ " + fjob.text)
+        elif fjob:
+            st.caption(fjob.text)
         stt = kb.stats()
         st.write(f"صفحات ناجحة: **{stt['ok']}** — فاشلة/غير متاحة: **{stt['failed']}** — مقاطع: **{stt['chunks']}**")
-        st.caption("تنبيه: هذه الأرقام تخص الصفحات التي جُلبت فقط، ولا تعني فهرسة المواقع بالكامل.")
-        reg = {s["url"]: s for s in REGISTERED_SOURCES}
-        for url, p in list(kb.pages.items()):
+        st.caption("هذه الأرقام تخص الصفحات التي جُلبت فقط، ولا تعني فهرسة المواقع بالكامل.")
+        for url, p in kb.snapshot():
             c1, c2, c3 = st.columns([5, 1, 1])
             stale = " ⏳ قديم" if kb.is_stale(p) else ""
-            c1.write(f"{'✅' if p['status']=='ok' else '⚠️'} {p['name']} — {p['title'][:60] or url}{stale}  \n`{url}`" + (f"  \n{p['error']}" if p["error"] else ""))
-            if c2.button("تحديث", key="r_" + url):
-                kb.ingest(reg.get(url, {"url": url, "kind": p["kind"], "name": p["name"]}), False, 1)
+            mine = " 👤 (جلستك فقط)" if p.get("session") else ""
+            c1.write(f"{'✅' if p['status']=='ok' else '⚠️'} {p['name']} — {(p['title'] or url)[:60]}{stale}{mine}  \n`{url}`"
+                     + (f"  \n{p['error']}" if p["error"] else ""))
+            if c2.button("تحديث", key="r_" + url, disabled=fetching):
+                start_fetch([{"url": url, "kind": p["kind"], "name": p["name"]}], False, 1, bool(p.get("session")))
                 st.rerun()
             if c3.button("حذف", key="rm_" + url):
                 kb.remove(url)
                 st.rerun()
-        extra_url = st.text_input("إضافة رابط مرجع معتمد")
-        if st.button("إضافة") and extra_url.startswith("http"):
-            guarded(lambda: kb.ingest({"url": extra_url, "kind": "general", "name": urlparse(extra_url).netloc}, False, 1))
-            st.rerun()
+        st.divider()
+        st.text_input("إضافة رابط مرجع (صفحة ويب أو ملف PDF/DOCX)", key="link_url", placeholder="https://...")
+        st.checkbox("اجلب أيضًا الصفحات القريبة في نفس القسم (حتى 3 صفحات)", key="link_follow")
+        st.button("إضافة", on_click=add_link, disabled=fetching)
+        lm = ss.pop("link_msg", None)
+        if lm:
+            {"ok": st.success, "warn": st.warning, "err": st.error}[lm[0]](lm[1])
         unreg = [s["name"] for s in REGISTERED_SOURCES if s["url"] not in kb.pages]
         if unreg:
             st.caption("مصادر مسجلة لم تُجلب بعد: " + "، ".join(unreg))
 
-    st.markdown('<div class="foot">✝️ للخدمة — كل محتوى مُولَّد يحتاج مراجعة الخادم المسؤول قبل الاستخدام</div>',
+    st.markdown('<div class="foot">✝️ للخدمة — كل محتوى مُولَّد مسودة تحتاج مراجعة الخادم المسؤول قبل الاستخدام</div>',
                 unsafe_allow_html=True)
 
 
@@ -1683,8 +1938,9 @@ def run_selftests() -> int:
     import unittest
 
     class R:
-        def __init__(self, code=200, js=None, text="", headers=None):
+        def __init__(self, code=200, js=None, text="", headers=None, content=b""):
             self.status_code, self._js, self.text, self.headers = code, js, text, headers or {}
+            self.content = content
             self.encoding = "utf-8"
             self.apparent_encoding = "utf-8"
 
@@ -1921,7 +2177,7 @@ def run_selftests() -> int:
 
         def _kb(self, seq):
             d = tempfile.mkdtemp()
-            return KnowledgeBase(os.path.join(d, "kb.json"), http=FakeHTTP(seq), sleep=nosleep, delay=0)
+            return KnowledgeBase(os.path.join(d, "kb.json"), http=FakeHTTP(seq), sleep=nosleep, delay=0, check_url=lambda u: (True, ""))
 
         def test_ingest_metadata_and_retrieval(self):
             kb = self._kb([R(404), R(200, text=HTML), R(404), R(200, text=HTML.replace("sec/b", "sec/c"))])
@@ -2072,6 +2328,126 @@ def run_selftests() -> int:
             bad = Job(1)
             run_job(bad, S, self._kb([]), lambda: LLMProvider([]), ["quiz"], False, True)
             self.assertTrue(bad.finished and not bad.ok and "quiz" in bad.errors)
+
+        def test_curriculum_style_lesson(self):
+            lesson = json.dumps({
+                "title": "الكنيسة", "main_idea": "الكنيسة هي ملكوت السموات على الأرض",
+                "objectives": ["يعرف قدسية الكنيسة", "يشعر بحضور السمائيين"],
+                "memory_verse": "أَمَّا أَنَا فَبِكَثْرَةِ رَحْمَتِكَ أَدْخُلُ بَيْتَكَ (مز 5: 7)",
+                "intro_questions": ["ايه هي الكنيسة؟", "ايه هو شكل كنيستنا؟"],
+                "sections": [{"heading": "أشكال الكنيسة",
+                              "body": "1. سفينة: بتفكرنا بفلك نوح\n2. صليب: لأن ربنا فدانا على الصليب\n- تفصيلة صغيرة"}],
+            }, ensure_ascii=False)
+            S = new_state()
+            S["input"] = "درس عن الكنيسة"
+            p, _ = self._prov([lesson])
+            run_task("lesson", S, self._kb([]), p)
+            B = component_blocks("lesson", S["lesson"])
+            texts = [t for _, t in B]
+            order = [texts.index(x) for x in ("❖ هدف الدرس", "❖ آية الدرس", "❖ أسئلة تمهيدية للدرس", "❖ الدرس")]
+            self.assertEqual(order, sorted(order))
+            self.assertIn("مساعدة الطفل أن:", texts)
+            self.assertIn(("p", "1. سفينة: بتفكرنا بفلك نوح"), B)
+            self.assertIn(("li", "تفصيلة صغيرة"), B)
+            # old-format lesson data still renders
+            old = component_blocks("lesson", Lesson(title="درس", objectives=["أ"], sections=[LessonSection(heading="ع", body="نص")]).model_dump())
+            self.assertIn(("h1", "درس"), old)
+
+        def test_url_validation(self):
+            res = lambda ip: (lambda host, port: [(2, 1, 6, "", (ip, 0))])
+            self.assertFalse(safe_public_url("ftp://a.org/x")[0])
+            self.assertFalse(safe_public_url("not a url")[0])
+            self.assertFalse(safe_public_url("http://localhost/x")[0])
+            self.assertFalse(safe_public_url("https://a.org", res("10.0.0.5"))[0])
+            self.assertFalse(safe_public_url("https://a.org", res("169.254.169.254"))[0])
+            self.assertFalse(safe_public_url("https://a.org", res("127.0.0.1"))[0])
+            self.assertTrue(safe_public_url("https://a.org", res("93.184.216.34"))[0])
+
+            def boom(h, p):
+                raise OSError("nx")
+            self.assertFalse(safe_public_url("https://nx.invalid", boom)[0])
+
+        def test_kb_blocks_unsafe_url_without_request(self):
+            d = tempfile.mkdtemp()
+            h = FakeHTTP([])
+            kb = KnowledgeBase(os.path.join(d, "kb.json"), http=h, sleep=nosleep, delay=0)
+            kb.check_url = lambda u: safe_public_url(u, lambda host, port: [(2, 1, 6, "", ("10.1.1.1", 0))])
+            kb.ingest({"url": "https://intranet.example/a.html", "kind": "general", "name": "x"}, False, 1)
+            self.assertEqual(h.calls, [])
+            self.assertEqual(kb.pages["https://intranet.example/a.html"]["status"], "unavailable")
+
+        def test_session_link_not_persisted(self):
+            kb = self._kb([R(404), R(200, text=HTML)])
+            url = "https://x.org/a.html"
+            kb.ingest({"url": url, "kind": "general", "name": "x"}, False, 1, session=True)
+            self.assertTrue(kb.pages[url].get("session") and kb.pages[url]["status"] == "ok")
+            kb2 = KnowledgeBase(kb.cache_path, http=FakeHTTP([]), sleep=nosleep, delay=0)
+            self.assertNotIn(url, kb2.pages)
+
+        def test_shared_page_persisted(self):
+            kb = self._kb([R(404), R(200, text=HTML)])
+            url = "https://x.org/a.html"
+            kb.ingest({"url": url, "kind": "feasts", "name": "x"}, False, 1)
+            kb2 = KnowledgeBase(kb.cache_path, http=FakeHTTP([]), sleep=nosleep, delay=0)
+            self.assertEqual(kb2.pages[url]["status"], "ok")
+
+        def test_pdf_link_dispatch(self):
+            txt = "\n".join(["الكنيسة بيت الله ونحن نجتمع فيها لنصلي لربنا كل أسبوع في يوم الأحد"] * 3)
+            real = globals()["extract_doc_text"]
+            globals()["extract_doc_text"] = lambda name, data: (txt, "")
+            try:
+                kb = self._kb([R(404), R(200, headers={"Content-Type": "application/pdf"})])
+                kb.ingest({"url": "https://x.org/lesson.pdf", "kind": "general", "name": "x"}, False, 1)
+            finally:
+                globals()["extract_doc_text"] = real
+            p = kb.pages["https://x.org/lesson.pdf"]
+            self.assertEqual(p["status"], "ok")
+            self.assertEqual(p["chunks"][0]["origin"], "web")
+
+        def test_stale_failed_retried_after_a_day(self):
+            kb = self._kb([])
+            recent = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+            old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).isoformat(timespec="seconds")
+            self.assertFalse(kb.is_stale({"status": "ok", "retrieved_at": old}))
+            self.assertFalse(kb.is_stale({"status": "unavailable", "retrieved_at": recent}))
+            self.assertTrue(kb.is_stale({"status": "unavailable", "retrieved_at": old}))
+
+        def test_fetch_job(self):
+            kb = self._kb([R(404), R(200, text=HTML)])
+            job = Job(1)
+            run_fetch(job, kb, [{"url": "https://x.org/a.html", "kind": "general", "name": "x"}], False, 1)
+            self.assertTrue(job.finished and job.ok)
+            self.assertEqual(kb.stats()["ok"], 1)
+
+        def test_safety_word_boundary(self):
+            self.assertEqual(local_safety_scan("بنينا منارة جميلة وقصة نارية"), [])
+            self.assertTrue(local_safety_scan("نشعل النار في الساحة"))
+            self.assertTrue(local_safety_scan("نستخدم ماء مغلي"))
+
+        def test_fire_in_lesson_text_not_blocked_but_in_activity_is(self):
+            val = json.dumps({"biblical_alignment_ok": True, "safety_ok": True, "confidence": 0.9, "issues": []})
+            S = new_state()
+            S["lesson"] = {"title": "العنصرة", "sections": [{"heading": "ألسنة من نار", "body": "حل الروح القدس"}]}
+            p, _ = self._prov([val])
+            run_validation(S, p)
+            self.assertEqual(S["gate"], "ok")
+
+        def test_short_curriculum_sent_whole(self):
+            kb = self._kb([])
+            S = new_state()
+            S["input"] = "الصدق"          # a title that matches nothing in the curriculum text
+            cur = [Chunk("نص عن الكنيسة بيت الله", "c", "local:c", "local:c", "", "sunday_school", "s", origin="curriculum"),
+                   Chunk("تقسيمة الكنيسة من الداخل", "c", "local:c", "local:c", "", "sunday_school", "s", origin="curriculum")]
+            S["curriculum_chunks"] = cur
+            ch, _ = retrieve_for(S, kb)
+            self.assertEqual(ch, cur)
+
+        def test_export_draft_notice_until_approved(self):
+            S = new_state()
+            S["lesson"] = Lesson(title="درس", sections=[LessonSection(heading="ع", body="نص")]).model_dump()
+            self.assertEqual(export_sets(S, False)["الدرس"][0][0], "p")
+            self.assertIn("مسودة", export_sets(S, False)["الدرس"][0][1])
+            self.assertEqual(export_sets(S, True)["الدرس"][0], ("h1", "درس"))
 
         def test_exports(self):
             S = new_state()
