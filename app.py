@@ -1586,8 +1586,10 @@ def main_app():
     for k, v in (("auto_fb", True), ("skip_done", True), ("approved", False), ("title", ""), ("notes", ""),
                  ("link_url", ""), ("link_follow", False)):
         ss.setdefault(k, v)
-    if "kb" not in ss:
+    # A KnowledgeBase kept in the session by an OLDER version of this file lacks newer methods -> rebuild it.
+    if "kb" not in ss or not all(hasattr(ss["kb"], m) for m in ("snapshot", "check_url", "is_stale")):
         ss["kb"] = KnowledgeBase()
+        ss.pop("auto_fetched", None)
     if "free_map" not in ss:
         try:
             ss["free_map"], ss["catalog_ok"] = pick_engine_models(free_models(fetch_catalog())), True
