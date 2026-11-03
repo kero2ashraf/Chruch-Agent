@@ -51,7 +51,7 @@ from pydantic import BaseModel, ValidationError, field_validator
 # 0. CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 APP_TITLE_AR = "مساعد مدارس الأحد الذكي"
-BUILD = "final-v10.3-friday-calendar"
+BUILD = "final-v10.4-schedule-date-repair"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 ROUTER_FREE = "openrouter/free"
@@ -2292,7 +2292,8 @@ def main_app():
     st.markdown('<div class="sec">📅 جدول دروس الكنيسة</div>', unsafe_allow_html=True)
     sched = ss["schedule"]  # Saved to disk only by the "pin" button.
     if sched:
-        st.success(f"📌 الجدول مثبّت ومحفوظ ({len(sched)} درس). يظل متاحًا بعد تحديث الصفحة وإعادة فتح التطبيق على نفس التخزين.")
+        dated_count = sum(bool(r.get("date")) for r in sched)
+        st.success(f"📌 الجدول مثبّت ومحفوظ ({len(sched)} درس، منها {dated_count} بتاريخ محدد). يظل متاحًا بعد تحديث الصفحة وإعادة فتح التطبيق على نفس التخزين.")
         fridays = friday_schedule(sched, dt.date.today(), 4)
         st.markdown("**🗓️ دروس الجُمَع الأربع القادمة حسب التقويم**")
         for fday in fridays:
@@ -2332,10 +2333,10 @@ def main_app():
             undated = sum(not r.get("date") for r in pending)
             if undated:
                 st.warning(f"⚠️ توجد {undated} صفوف لم تُفهم تواريخها؛ ستظهر دون تذكير تلقائي حتى تصحيح التاريخ.")
-            st.caption("لو السنة مش مكتوبة (مثل «6 نوفمبر»)، تُستخدم أقرب سنة قادمة وقت رفع الملف وتُحفظ كتاريخ كامل عند التثبيت. راجع التواريخ قبل الضغط على تثبيت.")
+            st.caption("تثبيت الملف الجديد يستبدل الجدول المثبّت السابق بالكامل. لو السنة مش مكتوبة، تُستنتج سنة قريبة وقت الاستيراد؛ راجع التواريخ قبل التثبيت.")
             st.dataframe(pending, use_container_width=True, hide_index=True)
             if st.button("📌 تثبيت الجدول", type="primary", key="pin_schedule"):
-                new_schedule = merge_schedule(sched, pending)
+                new_schedule = [dict(r) for r in pending]  # Explicit pin replaces the previous schedule; no duplicate undated rows.
                 try:
                     persist_pinned_schedule(new_schedule)
                 except OSError as exc:
@@ -2353,7 +2354,11 @@ def main_app():
             st.text_input("بحث بالعنوان أو التاريخ أو الخادم", key="sched_q")
             shown = search_schedule(sched, ss["sched_q"]) if ss["sched_q"].strip() else upcoming(sched, dt.date.today(), 8)
             if not shown and not ss["sched_q"].strip():
-                st.caption("لا توجد دروس قادمة؛ استخدم البحث لعرض الدروس القديمة.")
+                shown = [r for r in sched if not r.get("date")]
+                if shown:
+                    st.warning("الدروس التالية بلا تاريخ؛ صحّح التواريخ أعلاه لتظهر في تقويم الجُمَع.")
+                else:
+                    st.caption("لا توجد دروس قادمة؛ استخدم البحث لعرض الدروس القديمة.")
             for i_, r_ in enumerate(shown):
                 c1_, c2_ = st.columns([4, 1])
                 c1_.write(f"**{r_['title']}** — {r_.get('date') or 'بدون تاريخ'}"
@@ -2368,6 +2373,47 @@ def main_app():
                         st.error(f"تعذر حذف الجدول: {exc}")
                     else:
                         ss["schedule"] = []
+                        st.rerun()
+
+    # v10.4: correct dates in an already pinned schedule without re-uploading.
+    # Never infer a Friday from row order; only save explicit user-reviewed dates.
+    if sched and any(not r.get("date") for r in sched):
+        with st.expander("🛠️ تصحيح تواريخ الجدول المثبّت", expanded=True):
+            st.warning("الجدول المثبّت فيه دروس بدون تاريخ. اكتب تاريخ كل درس كما هو في المصدر، ثم احفظ. لا تُربط الدروس بأيام الجمعة حسب ترتيب الصفوف تلقائيًا.")
+            fixes = {}
+            for row_index, record in enumerate(sched):
+                if record.get("date"):
+                    continue
+                left, right = st.columns([3, 2])
+                left.write(f"**{record.get('title', 'درس بدون عنوان')}**")
+                date_text = right.text_input(
+                    "التاريخ (مثال: 6 نوفمبر 2026)",
+                    key=f"pinned_date_fix_{row_index}",
+                    placeholder="6 نوفمبر 2026",
+                ).strip()
+                if date_text:
+                    fixes[row_index] = date_text
+            if st.button("💾 حفظ التواريخ المصحّحة", key="save_pinned_date_fixes"):
+                amended = [dict(item) for item in sched]
+                invalid = []
+                for row_index, date_text in fixes.items():
+                    parsed = parse_date(date_text)
+                    if not parsed:
+                        invalid.append(f"{amended[row_index]['title']}: {date_text}")
+                    else:
+                        amended[row_index]["date"] = parsed.isoformat()
+                if not fixes:
+                    st.warning("اكتب تاريخ درس واحد على الأقل قبل الحفظ.")
+                elif invalid:
+                    st.error("تواريخ غير مفهومة: " + "، ".join(invalid))
+                else:
+                    try:
+                        persist_pinned_schedule(amended)
+                    except OSError as exc:
+                        st.error(f"تعذّر حفظ التواريخ: {exc}")
+                    else:
+                        ss["schedule"] = amended
+                        st.success("تم حفظ التواريخ في الجدول المثبّت.")
                         st.rerun()
 
     # ---------------- 1) lesson title ----------------
@@ -3194,6 +3240,13 @@ def run_selftests() -> int:
             model_context = schedule_chat_context(parsed, reference)
             self.assertIn("الجمعة الجاية (6 نوفمبر 2026): درس أول", model_context)
             self.assertIn("27 نوفمبر 2026", model_context)
+
+        def test_pinned_missing_dates_need_explicit_correction(self):
+            today = dt.date(2026, 11, 3)
+            rows = [{"date": "", "title": "الكتاب المقدس"}]
+            self.assertFalse(friday_schedule(rows, today)[0]["lessons"])
+            rows[0]["date"] = parse_date("6 نوفمبر 2026").isoformat()
+            self.assertEqual(friday_schedule(rows, today)[0]["lessons"][0]["title"], "الكتاب المقدس")
 
         def test_missing_friday_does_not_invent_lesson(self):
             today = dt.date(2026, 11, 3)
