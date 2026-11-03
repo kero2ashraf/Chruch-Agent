@@ -51,7 +51,7 @@ from pydantic import BaseModel, ValidationError, field_validator
 # 0. CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 APP_TITLE_AR = "مساعد مدارس الأحد الذكي"
-BUILD = "final-v10.1-openpyxl"
+BUILD = "final-v10.2-pinned-schedule"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 ROUTER_FREE = "openrouter/free"
@@ -912,7 +912,7 @@ def scrub_leaks(obj: Any, flags: List[str]) -> Any:
 # ════════════════════════════════════════════════════════════════════════════
 # v10 ADDITIONS: church template, age stage / venue, schedule, confidence, library
 # ════════════════════════════════════════════════════════════════════════════
-SCHEDULE_PATH = os.path.join(DATA_DIR, "schedule.json")
+SCHEDULE_PATH = os.path.join(DATA_DIR, "pinned_schedule.json")
 LIBRARY_PATH = os.path.join(DATA_DIR, "library.json")
 PROFILE_PATH = os.path.join(DATA_DIR, "church_profile.json")
 LOGO_PATH = os.path.join(DATA_DIR, "church_logo.bin")
@@ -957,6 +957,37 @@ def save_json(path: str, obj: Any):
         os.replace(tmp, path)
     except Exception as e:
         log.warning("could not save %s: %s", path, e)
+
+
+def persist_pinned_schedule(rows: List[dict], path: str = SCHEDULE_PATH) -> None:
+    """Persist only on explicit user approval. Raise on failure; never claim saved otherwise."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    temp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.remove(temp)
+
+
+def schedule_chat_context(rows: List[dict], today: dt.date) -> str:
+    """Provide verified saved schedule to model, not as a guessed calendar."""
+    if not rows:
+        return "لا يوجد جدول دروس مثبّت. لا تفترض مواعيد أو عناوين دروس."
+    ordered = sorted(rows, key=lambda r: (r.get("date") or "9999", r.get("title", "")))
+    next_rows = upcoming(ordered, today, 1)
+    head = (f"الدرس القادم حسب الجدول المثبّت: {next_rows[0]['title']} بتاريخ {next_rows[0]['date']}."
+            if next_rows else "لا توجد دروس مؤرخة قادمة في الجدول المثبّت.")
+    details = [{k: r.get(k, "") for k in ("date", "title", "stage", "owner", "topic", "verses")}
+               for r in ordered]
+    return (f"تاريخ اليوم: {today.isoformat()}. {head}\n"
+            "هذا هو جدول الدروس المثبّت الذي رفعه المستخدم؛ استخدم تواريخه وعناوينه كما هي، "
+            "وإذا كانت خانة ناقصة فلا تخمّنها.\n"
+            + json.dumps(details, ensure_ascii=False)[:15000])
 
 
 def gregorian_to_coptic(d: dt.date) -> Tuple[int, int, int]:
@@ -1999,6 +2030,7 @@ def main_app():
         ss["p_servant"] = pr.get("servant", ss["p_servant"])
         ss["tpl"] = [k for k in pr.get("tpl", list(TPL_KEYS)) if k in TPL_KEYS] or list(TPL_KEYS)
         ss["schedule"] = load_json(SCHEDULE_PATH, [])
+        ss["pending_schedule"] = None
         ss["library"] = load_json(LIBRARY_PATH, [])
         try:
             with open(LOGO_PATH, "rb") as f_:
@@ -2188,38 +2220,76 @@ def main_app():
 
     st.info("🤝 المساعد بيقترح مسودة بس — أنت اللي بتراجع وتعدّل وتقرر قبل ما تستخدم أي حاجة.")
 
-    # ---------------- 0) church lesson schedule ----------------
+    # ---------------- 0) church lesson schedule: staged upload, explicit PIN ----------------
     st.markdown('<div class="sec">📅 جدول دروس الكنيسة</div>', unsafe_allow_html=True)
-    sched = ss["schedule"]
-    nxt = upcoming(sched, dt.date.today(), 1)
-    if nxt:
-        st.info(f"🔔 الدرس القادم: **{nxt[0]['title']}** — {nxt[0]['date']}" + (f" — {nxt[0]['stage']}" if nxt[0].get("stage") else ""))
-    with st.expander(f"📅 الجدول ({len(sched)} درس) — رفع / بحث / بدء التحضير"):
+    sched = ss["schedule"]  # Saved to disk only by the "pin" button.
+    if sched:
+        st.success(f"📌 الجدول مثبّت ومحفوظ ({len(sched)} درس). يظل متاحًا بعد تحديث الصفحة وإعادة فتح التطبيق على نفس التخزين.")
+        nxt = upcoming(sched, dt.date.today(), 1)
+        if nxt:
+            nr = nxt[0]
+            days = (dt.date.fromisoformat(nr["date"]) - dt.date.today()).days
+            when = "اليوم" if days == 0 else ("بكرة" if days == 1 else f"بعد {days} يوم")
+            st.info(f"🔔 تذكير: عندك درس **{nr['title']}** يوم {nr['date']} ({when}). تحب أساعدك في التحضير؟")
+            if st.button("✨ حضّر الدرس القادم", key="prepare_next_pinned", on_click=use_row, args=(nr,)):
+                st.rerun()
+        else:
+            st.info("لا يوجد درس قادم بتاريخ معروف في الجدول المحفوظ.")
+    else:
+        st.caption("لم يتم تثبيت جدول دروس بعد. ارفع ملف Excel/CSV ثم اضغط «📌 تثبيت الجدول».")
+
+    with st.expander(f"📅 الجدول ({len(sched)} درس محفوظ) — رفع / تثبيت / بحث / بدء التحضير"):
         up = st.file_uploader("ارفع الجدول (Excel أو CSV أو PDF) — الأعمدة: التاريخ، عنوان الدرس، المرحلة، المسؤول، نوع الموضوع، الآيات",
                               type=["xlsx", "csv", "pdf"], key="sched_up")
-        if up is not None and ss.get("sched_sig") != (up.name, up.size):
-            rows_, err_ = parse_schedule(up.name, up.getvalue())
-            if err_:
-                st.error(err_)
-            else:
-                ss["schedule"] = merge_schedule(ss["schedule"], rows_)
-                save_json(SCHEDULE_PATH, ss["schedule"])
-                ss["sched_sig"] = (up.name, up.size)
-                sched = ss["schedule"]
-                st.success(f"تم تحديث الجدول بـ {len(rows_)} درس (المكرر يُحدَّث بدون إدخال يدوي).")
-        st.text_input("بحث بالعنوان أو التاريخ أو الخادم", key="sched_q")
-        shown = search_schedule(sched, ss["sched_q"]) if ss["sched_q"].strip() else upcoming(sched, dt.date.today(), 8)
-        if not shown:
-            st.caption("لا توجد دروس لعرضها.")
-        for i_, r_ in enumerate(shown):
-            c1_, c2_ = st.columns([4, 1])
-            c1_.write(f"**{r_['title']}** — {r_.get('date') or 'بدون تاريخ'}"
-                      + "".join(f" — {r_[k]}" for k in ("stage", "owner", "verses") if r_.get(k)))
-            c2_.button("ابدأ التحضير", key=f"sr_{i_}", on_click=use_row, args=(r_,))
-        if sched and st.button("🗑️ مسح الجدول", key="sched_clear"):
-            ss["schedule"] = []
-            save_json(SCHEDULE_PATH, [])
-            st.rerun()
+        if up is not None:
+            import hashlib
+            file_signature = hashlib.sha256(up.getvalue()).hexdigest()
+            if ss.get("pending_schedule_sig") != file_signature:
+                rows_, err_ = parse_schedule(up.name, up.getvalue())
+                ss["pending_schedule_sig"] = file_signature
+                ss["pending_schedule_error"] = err_
+                ss["pending_schedule"] = rows_ if not err_ else None
+            if ss.get("pending_schedule_error"):
+                st.error(ss["pending_schedule_error"])
+        pending = ss.get("pending_schedule")
+        if pending:
+            st.write(f"**معاينة قبل التثبيت: {len(pending)} درس من الملف الجديد**")
+            st.dataframe(pending, use_container_width=True, hide_index=True)
+            if st.button("📌 تثبيت الجدول", type="primary", key="pin_schedule"):
+                new_schedule = merge_schedule(sched, pending)
+                try:
+                    persist_pinned_schedule(new_schedule)
+                except OSError as exc:
+                    st.error(f"تعذر حفظ الجدول على القرص: {exc}")
+                else:
+                    ss["schedule"] = new_schedule
+                    ss["pending_schedule"] = None
+                    # Keep the upload fingerprint so the same uploaded file is not re-staged on rerun.
+                    ss["pending_schedule_sig"] = file_signature
+                    ss["pending_schedule_error"] = ""
+                    st.success("✅ تم تثبيت الجدول وحفظه بنجاح.")
+                    st.rerun()
+
+        if sched:
+            st.text_input("بحث بالعنوان أو التاريخ أو الخادم", key="sched_q")
+            shown = search_schedule(sched, ss["sched_q"]) if ss["sched_q"].strip() else upcoming(sched, dt.date.today(), 8)
+            if not shown and not ss["sched_q"].strip():
+                st.caption("لا توجد دروس قادمة؛ استخدم البحث لعرض الدروس القديمة.")
+            for i_, r_ in enumerate(shown):
+                c1_, c2_ = st.columns([4, 1])
+                c1_.write(f"**{r_['title']}** — {r_.get('date') or 'بدون تاريخ'}"
+                          + "".join(f" — {r_[k]}" for k in ("stage", "owner", "verses") if r_.get(k)))
+                c2_.button("ابدأ التحضير", key=f"sr_{i_}", on_click=use_row, args=(r_,))
+            with st.popover("🗑️ إلغاء التثبيت ومسح الجدول"):
+                st.warning("سيتم حذف الجدول المحفوظ من هذا التطبيق.")
+                if st.button("تأكيد حذف الجدول المثبّت", key="sched_clear_confirm"):
+                    try:
+                        persist_pinned_schedule([])
+                    except OSError as exc:
+                        st.error(f"تعذر حذف الجدول: {exc}")
+                    else:
+                        ss["schedule"] = []
+                        st.rerun()
 
     # ---------------- 1) lesson title ----------------
     st.markdown('<div class="sec">📝 عنوان الدرس</div>', unsafe_allow_html=True)
@@ -2422,7 +2492,9 @@ def main_app():
             st.chat_message("user").markdown(msg)
             chunks, o = retrieve_for(S, kb, msg)
             hist = [{"role": m["role"], "content": m["content"]} for m in S["chat"][-8:]]
-            sysmsg = CHAT_SYSTEM + "\n\nالمراجع المسترجعة:\n" + build_context(chunks, o)
+            sysmsg = (CHAT_SYSTEM + "\n\nالجدول الثابت للكنيسة:\n"
+                      + schedule_chat_context(ss["schedule"], dt.date.today())
+                      + "\n\nالمراجع المسترجعة:\n" + build_context(chunks, o))
             ans = guarded(lambda: provider().chat([{"role": "system", "content": sysmsg}] + hist), "...")
             if ans:
                 S["chat"].append({"role": "assistant", "content": ans})
@@ -3075,6 +3147,18 @@ def run_selftests() -> int:
             self.assertNotIn("❖ هدف الدرس", [t for _, t in blocks])
             S["prep"]["church"] = "كنيسة"
             self.assertEqual(header_blocks(S)[0], ("h2", "كنيسة"))
+
+        def test_pinned_schedule_persists_and_informs_chat(self):
+            import tempfile
+            with tempfile.TemporaryDirectory() as folder:
+                path = os.path.join(folder, "schedule.json")
+                entries = [{"date": "2026-11-06", "title": "المحبة", "stage": "ابتدائي",
+                            "owner": "مينا", "topic": "", "verses": ""}]
+                persist_pinned_schedule(entries, path)
+                reloaded = load_json(path, [])
+                self.assertEqual(reloaded, entries)
+                self.assertIn("المحبة", schedule_chat_context(reloaded, dt.date(2026, 11, 3)))
+                self.assertIn("2026-11-06", schedule_chat_context(reloaded, dt.date(2026, 11, 3)))
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(T)
     res = unittest.TextTestRunner(verbosity=2).run(suite)
