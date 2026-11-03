@@ -51,7 +51,7 @@ from pydantic import BaseModel, ValidationError, field_validator
 # 0. CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 APP_TITLE_AR = "مساعد مدارس الأحد الذكي"
-BUILD = "final-v10.2-pinned-schedule"
+BUILD = "final-v10.3-friday-calendar"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 ROUTER_FREE = "openrouter/free"
@@ -974,19 +974,56 @@ def persist_pinned_schedule(rows: List[dict], path: str = SCHEDULE_PATH) -> None
             os.remove(temp)
 
 
+AR_MONTHS = {
+    "يناير": 1, "كانون الثاني": 1, "فبراير": 2, "شباط": 2,
+    "مارس": 3, "اذار": 3, "أبريل": 4, "ابريل": 4, "نيسان": 4,
+    "مايو": 5, "ماي": 5, "أيار": 5, "ايار": 5, "يونيو": 6, "حزيران": 6,
+    "يوليو": 7, "تموز": 7, "أغسطس": 8, "اغسطس": 8, "آب": 8, "اب": 8,
+    "سبتمبر": 9, "أيلول": 9, "ايلول": 9, "أكتوبر": 10, "اكتوبر": 10, "تشرين الأول": 10,
+    "نوفمبر": 11, "تشرين الثاني": 11, "ديسمبر": 12, "كانون الأول": 12,
+}
+MONTH_LABELS = ("", "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو",
+                "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر")
+
+
+def next_fridays(today: dt.date, count: int = 4) -> List[dt.date]:
+    """Upcoming Fridays; include today if today is Friday."""
+    offset = (4 - today.weekday()) % 7
+    first = today + dt.timedelta(days=offset)
+    return [first + dt.timedelta(days=7 * i) for i in range(count)]
+
+
+def friday_schedule(rows: List[dict], today: dt.date, count: int = 4) -> List[dict]:
+    """Show a calendar row for each Friday, including dates with no recorded lesson."""
+    result = []
+    for index, day in enumerate(next_fridays(today, count)):
+        lessons = [r for r in rows if r.get("date") == day.isoformat()]
+        result.append({"date": day.isoformat(), "label": f"{day.day} {MONTH_LABELS[day.month]} {day.year}",
+                       "week": index + 1, "lessons": lessons})
+    return result
+
+
 def schedule_chat_context(rows: List[dict], today: dt.date) -> str:
-    """Provide verified saved schedule to model, not as a guessed calendar."""
+    """Ground model responses in saved dated records and four actual Fridays."""
     if not rows:
         return "لا يوجد جدول دروس مثبّت. لا تفترض مواعيد أو عناوين دروس."
     ordered = sorted(rows, key=lambda r: (r.get("date") or "9999", r.get("title", "")))
+    fridays = friday_schedule(rows, today, 4)
+    preview = []
+    for x in fridays:
+        titles = "، ".join(r["title"] for r in x["lessons"]) if x["lessons"] else "لا يوجد درس مسجّل لهذا اليوم"
+        week_name = "الجمعة الجاية" if x["week"] == 1 else f"الجمعة رقم {x['week']} من اليوم"
+        preview.append(f"{week_name} ({x['label']}): {titles}")
     next_rows = upcoming(ordered, today, 1)
     head = (f"الدرس القادم حسب الجدول المثبّت: {next_rows[0]['title']} بتاريخ {next_rows[0]['date']}."
             if next_rows else "لا توجد دروس مؤرخة قادمة في الجدول المثبّت.")
     details = [{k: r.get(k, "") for k in ("date", "title", "stage", "owner", "topic", "verses")}
                for r in ordered]
     return (f"تاريخ اليوم: {today.isoformat()}. {head}\n"
-            "هذا هو جدول الدروس المثبّت الذي رفعه المستخدم؛ استخدم تواريخه وعناوينه كما هي، "
-            "وإذا كانت خانة ناقصة فلا تخمّنها.\n"
+            "جدول الجُمَع الأربع التالية (التواريخ محسوبة من التقويم الميلادي):\n"
+            + "\n".join(preview) + "\n"
+            "هذه بيانات المستخدم المثبّتة؛ لا تخترع درسًا ليوم ليس له سجل. "
+            "السنة غير المكتوبة في الملف حُددت عند الاستيراد، راجعها مع المستخدم عند الشك.\n"
             + json.dumps(details, ensure_ascii=False)[:15000])
 
 
@@ -1003,19 +1040,50 @@ def coptic_str(d: dt.date) -> str:
     return f"{cd} {COPTIC_MONTHS[cm - 1]} {cy} ش"
 
 
-def parse_date(s: Any) -> Optional[dt.date]:
+def parse_date(s: Any, reference: Optional[dt.date] = None) -> Optional[dt.date]:
+    """Parse ISO, Egyptian numeric dates, and Arabic month names e.g. 'الجمعة ٦ نوفمبر'.
+
+    If the year is absent, select the next occurrence relative to reference/today,
+    then persist the explicit ISO year on pinning; a refresh never re-infers it.
+    """
     if isinstance(s, dt.datetime):
         return s.date()
     if isinstance(s, dt.date):
         return s
-    parts = str(s or "").translate(AR_DIGITS).strip().split()
-    if not parts:
+    today = reference or dt.date.today()
+    raw = str(s or "").translate(AR_DIGITS).strip()
+    if not raw:
         return None
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%Y/%m/%d"):
+    raw = re.sub(r"[،,]+", " ", raw)
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%Y/%m/%d",
+                "%d/%m", "%d-%m"):
         try:
-            return dt.datetime.strptime(parts[0], fmt).date()
+            date_value = dt.datetime.strptime(raw, fmt).date()
+            if fmt in ("%d/%m", "%d-%m"):
+                date_value = dt.date(today.year, date_value.month, date_value.day)
+                if date_value < today:
+                    date_value = dt.date(today.year + 1, date_value.month, date_value.day)
+            return date_value
         except ValueError:
             continue
+    # Also accept day/month/year strings with spaces, Arabic digits and day names.
+    normalized = ar_norm(re.sub(r"[\u064b-\u065f]", "", raw)).replace("ـ", "")
+    for name, month in sorted(AR_MONTHS.items(), key=lambda item: -len(item[0])):
+        normalized_name = ar_norm(name)
+        m = re.search(r"(?<!\w)(\d{1,2})\s+" + re.escape(normalized_name) +
+                      r"(?:\s+(\d{4}))?(?!\w)", normalized)
+        if not m:
+            continue
+        day = int(m.group(1))
+        supplied_year = int(m.group(2)) if m.group(2) else None
+        year = supplied_year or today.year
+        try:
+            value = dt.date(year, month, day)
+            if supplied_year is None and value < today:
+                value = dt.date(year + 1, month, day)
+            return value
+        except ValueError:
+            return None
     return None
 
 
@@ -1050,7 +1118,7 @@ def rows_from_table(table: List[List[Any]]) -> Tuple[List[dict], str]:
         title = get("title")
         if not title:
             continue
-        d = parse_date(get("date"))
+        d = parse_date(row[colmap["date"]] if "date" in colmap and colmap["date"] < len(row) else "")
         rows.append({"date": d.isoformat() if d else "", "title": title, "stage": get("stage"),
                      "owner": get("owner"), "topic": get("topic"), "verses": get("verses")})
     return rows, ("" if rows else "الجدول فارغ.")
@@ -2225,16 +2293,23 @@ def main_app():
     sched = ss["schedule"]  # Saved to disk only by the "pin" button.
     if sched:
         st.success(f"📌 الجدول مثبّت ومحفوظ ({len(sched)} درس). يظل متاحًا بعد تحديث الصفحة وإعادة فتح التطبيق على نفس التخزين.")
-        nxt = upcoming(sched, dt.date.today(), 1)
-        if nxt:
-            nr = nxt[0]
-            days = (dt.date.fromisoformat(nr["date"]) - dt.date.today()).days
-            when = "اليوم" if days == 0 else ("بكرة" if days == 1 else f"بعد {days} يوم")
-            st.info(f"🔔 تذكير: عندك درس **{nr['title']}** يوم {nr['date']} ({when}). تحب أساعدك في التحضير؟")
-            if st.button("✨ حضّر الدرس القادم", key="prepare_next_pinned", on_click=use_row, args=(nr,)):
-                st.rerun()
-        else:
-            st.info("لا يوجد درس قادم بتاريخ معروف في الجدول المحفوظ.")
+        fridays = friday_schedule(sched, dt.date.today(), 4)
+        st.markdown("**🗓️ دروس الجُمَع الأربع القادمة حسب التقويم**")
+        for fday in fridays:
+            description = ("الجمعة الجاية" if fday["week"] == 1
+                           else f"الجمعة بعد {fday['week'] - 1} أسبوع")
+            st.markdown(f"**{description} — {fday['label']}**")
+            if not fday["lessons"]:
+                st.caption("لا يوجد درس مسجّل لهذا التاريخ في الجدول المثبّت.")
+            for j, lesson_row in enumerate(fday["lessons"]):
+                c_date, c_btn = st.columns([4, 1])
+                c_date.write(f"📖 **{lesson_row['title']}**"
+                             + (f" — {lesson_row['owner']}" if lesson_row.get("owner") else ""))
+                c_btn.button("✨ تحضير", key=f"friday_prep_{fday['week']}_{j}",
+                             on_click=use_row, args=(lesson_row,))
+        next_known = upcoming(sched, dt.date.today(), 1)
+        if next_known and next_known[0]["date"] not in {f["date"] for f in fridays}:
+            st.caption(f"أقرب درس مؤرّخ خارج الجُمَع المعروضة: {next_known[0]['title']} — {next_known[0]['date']}")
     else:
         st.caption("لم يتم تثبيت جدول دروس بعد. ارفع ملف Excel/CSV ثم اضغط «📌 تثبيت الجدول».")
 
@@ -2254,6 +2329,10 @@ def main_app():
         pending = ss.get("pending_schedule")
         if pending:
             st.write(f"**معاينة قبل التثبيت: {len(pending)} درس من الملف الجديد**")
+            undated = sum(not r.get("date") for r in pending)
+            if undated:
+                st.warning(f"⚠️ توجد {undated} صفوف لم تُفهم تواريخها؛ ستظهر دون تذكير تلقائي حتى تصحيح التاريخ.")
+            st.caption("لو السنة مش مكتوبة (مثل «6 نوفمبر»)، تُستخدم أقرب سنة قادمة وقت رفع الملف وتُحفظ كتاريخ كامل عند التثبيت. راجع التواريخ قبل الضغط على تثبيت.")
             st.dataframe(pending, use_container_width=True, hide_index=True)
             if st.button("📌 تثبيت الجدول", type="primary", key="pin_schedule"):
                 new_schedule = merge_schedule(sched, pending)
@@ -3096,6 +3175,33 @@ def run_selftests() -> int:
         def test_coptic_date(self):
             self.assertEqual(gregorian_to_coptic(dt.date(2026, 9, 11)), (1743, 1, 1))
             self.assertEqual(gregorian_to_coptic(dt.date(2026, 1, 7)), (1742, 4, 29))
+
+        def test_arabic_month_schedule_and_fridays(self):
+            reference = dt.date(2026, 11, 3)
+            for cell in ("6 نوفمبر", "٦ نوفمبر", "الجمعة 6 نوفمبر", "6 نُوفمبر", "6/11"):
+                self.assertEqual(parse_date(cell, reference), dt.date(2026, 11, 6), cell)
+            self.assertEqual(parse_date("13 نوفمبر", reference), dt.date(2026, 11, 13))
+            self.assertEqual(parse_date("27 نوفمبر 2026", reference), dt.date(2026, 11, 27))
+            self.assertEqual(parse_date("6 نوفمبر", dt.date(2026, 12, 1)), dt.date(2027, 11, 6))
+            self.assertEqual(next_fridays(reference), [dt.date(2026, 11, d) for d in (6, 13, 20, 27)])
+            cells = [["التاريخ", "عنوان الدرس"], ["6 نوفمبر", "درس أول"], ["13 نوفمبر", "درس ثاني"],
+                     ["20 نوفمبر", "درس ثالث"], ["27 نوفمبر", "درس رابع"]]
+            parsed, error = rows_from_table(cells)
+            self.assertEqual(error, "")
+            calendar = friday_schedule(parsed, reference)
+            self.assertEqual([f["lessons"][0]["title"] for f in calendar],
+                             ["درس أول", "درس ثاني", "درس ثالث", "درس رابع"])
+            model_context = schedule_chat_context(parsed, reference)
+            self.assertIn("الجمعة الجاية (6 نوفمبر 2026): درس أول", model_context)
+            self.assertIn("27 نوفمبر 2026", model_context)
+
+        def test_missing_friday_does_not_invent_lesson(self):
+            today = dt.date(2026, 11, 3)
+            rows = [{"date": "2026-11-06", "title": "المحبة"}]
+            days = friday_schedule(rows, today)
+            self.assertEqual(len(days), 4)
+            self.assertEqual([len(d["lessons"]) for d in days], [1, 0, 0, 0])
+            self.assertIn("لا يوجد درس مسجّل لهذا اليوم", schedule_chat_context(rows, today))
 
         def test_schedule_xlsx_openpyxl(self):
             from openpyxl import Workbook
