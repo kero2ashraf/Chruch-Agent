@@ -51,7 +51,7 @@ from pydantic import BaseModel, ValidationError, field_validator
 # 0. CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 APP_TITLE_AR = "مساعد مدارس الأحد الذكي"
-BUILD = "final-v10"
+BUILD = "final-v10.1-openpyxl"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 ROUTER_FREE = "openrouter/free"
@@ -1032,9 +1032,22 @@ def parse_schedule(name: str, data: bytes) -> Tuple[List[dict], str]:
             import csv
             return rows_from_table(list(csv.reader(io.StringIO(data.decode("utf-8-sig", errors="replace")))))
         if low.endswith(".xlsx"):
-            import openpyxl
-            wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
-            return rows_from_table([list(r) for ws in wb.worksheets for r in ws.iter_rows(values_only=True)])
+            try:
+                from openpyxl import load_workbook
+            except ModuleNotFoundError as exc:
+                if exc.name != "openpyxl":
+                    raise
+                return [], ("مكتبة openpyxl غير مثبتة في بيئة تشغيل Streamlit. "
+                            "ثبّتها باستخدام: python3 -m pip install openpyxl "
+                            "أو أضف openpyxl>=3.1.0 إلى requirements.txt ثم أعد تشغيل التطبيق.")
+            wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+            try:
+                rows = []
+                for ws in wb.worksheets:
+                    rows.extend([list(r) for r in ws.iter_rows(values_only=True)])
+                return rows_from_table(rows)
+            finally:
+                wb.close()
         if low.endswith(".pdf"):
             text, err = extract_doc_text(name, data)
             if err:
@@ -1049,8 +1062,8 @@ def parse_schedule(name: str, data: bytes) -> Tuple[List[dict], str]:
                     if len(title) >= 3:
                         rows.append({"date": d.isoformat(), "title": title, "stage": "", "owner": "", "topic": "", "verses": ""})
             return rows, ("" if rows else "لم أستطع قراءة جدول من الـ PDF — جرّب Excel أو CSV (الصور تحتاج تحويلها لجدول أولًا).")
-    except ImportError:
-        return [], "مكتبة قراءة Excel غير مثبتة (pip install openpyxl)."
+    except ImportError as exc:
+        return [], f"تعذر تحميل مكتبة مطلوبة: {exc.name or 'غير معروفة'}. ثبّت المتطلبات عبر python3 -m pip install -r requirements.txt."
     except Exception:
         return [], "تعذر قراءة ملف الجدول."
     return [], "نوع الملف غير مدعوم (Excel أو CSV أو PDF)."
@@ -3011,6 +3024,20 @@ def run_selftests() -> int:
         def test_coptic_date(self):
             self.assertEqual(gregorian_to_coptic(dt.date(2026, 9, 11)), (1743, 1, 1))
             self.assertEqual(gregorian_to_coptic(dt.date(2026, 1, 7)), (1742, 4, 29))
+
+        def test_schedule_xlsx_openpyxl(self):
+            from openpyxl import Workbook
+            book = Workbook()
+            sheet = book.active
+            sheet.append(["التاريخ", "اسم الموضوع", "مسؤول اليوم", "نوع الموضوع"])
+            sheet.append(["2026-11-08", "درس الكنيسة", "مينا", "سلوكي"])
+            stream = io.BytesIO()
+            book.save(stream)
+            rows, error = parse_schedule("schedule.xlsx", stream.getvalue())
+            self.assertEqual(error, "")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["title"], "درس الكنيسة")
+            self.assertEqual(rows[0]["date"], "2026-11-08")
 
         def test_schedule_csv_merge_upcoming(self):
             csv_ = "التاريخ,عنوان الدرس,المرحلة,المسؤول\n2026-11-08,الكنيسة,ابتدائي,مينا\n١٠/١١/٢٠٢٦,الصدق,إعدادي,\n".encode("utf-8")
